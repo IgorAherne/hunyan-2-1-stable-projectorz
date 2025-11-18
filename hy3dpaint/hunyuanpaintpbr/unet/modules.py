@@ -195,6 +195,9 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         self.use_dino = use_dino
         self.pbr_setting = pbr_setting
 
+        # Optimization: STRICTLY FALSE to prevent float32 fallback in SDPA
+        force_no_upcast = False 
+
         if self.use_mda:
             self.attn1.set_processor(
                 SelfAttnProcessor2_0(
@@ -218,7 +221,7 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
                 dropout=self.dropout,
                 bias=self.attention_bias,
                 cross_attention_dim=None,
-                upcast_attention=self.attn1.upcast_attention,
+                upcast_attention=force_no_upcast, # OPTIMIZATION: Force False
                 out_bias=True,
                 processor=PoseRoPEAttnProcessor2_0(),
             )
@@ -231,7 +234,7 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
                 dropout=self.dropout,
                 bias=self.attention_bias,
                 cross_attention_dim=None,
-                upcast_attention=self.attn1.upcast_attention,
+                upcast_attention=force_no_upcast, # OPTIMIZATION: Force False
                 out_bias=True,
                 processor=RefAttnProcessor2_0(
                     query_dim=self.dim,
@@ -240,7 +243,7 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
                     dropout=self.dropout,
                     bias=self.attention_bias,
                     cross_attention_dim=None,
-                    upcast_attention=self.attn1.upcast_attention,
+                    upcast_attention=force_no_upcast, # OPTIMIZATION: Force False
                     out_bias=True,
                     pbr_setting=self.pbr_setting,
                 ),

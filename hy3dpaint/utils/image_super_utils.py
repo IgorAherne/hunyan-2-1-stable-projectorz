@@ -29,14 +29,14 @@ class imageSuperNet:
 
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
         
-        # FIX: Enable tiling (tile=512) to strictly respect VRAM limits (e.g., 8GB).
+        # FIX: Enable tiling (tile=768) to strictly respect VRAM limits (e.g., 8GB).
         # tile=0 means "process full image", which causes OOM/Shared Memory spill on 3K images.
         upsampler = RealESRGANer(
             scale=4,
             model_path=config.realesrgan_ckpt_path,
             dni_weight=None,
             model=model,
-            tile=512,       # Optimization: Process in 512px chunks
+            tile=768,       # Optimization: Process in 768px chunks
             tile_pad=10,
             pre_pad=0,
             half=True,

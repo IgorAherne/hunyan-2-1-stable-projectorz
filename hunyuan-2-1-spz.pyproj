@@ -618,6 +618,7 @@
     <Compile Include="hy3dpaint\hunyuanpaintpbr\unet\attn_processor.py" />
     <Compile Include="hy3dpaint\hunyuanpaintpbr\unet\model.py" />
     <Compile Include="hy3dpaint\hunyuanpaintpbr\unet\modules.py" />
+    <Compile Include="hy3dpaint\hunyuanpaintpbr\unet\profiler.py" />
     <Compile Include="hy3dpaint\hunyuanpaintpbr\__init__.py" />
     <Compile Include="hy3dpaint\src\data\dataloader\loader_util.py" />
     <Compile Include="hy3dpaint\src\data\dataloader\objaverse_loader_forTexturePBR.py" />

@@ -98,7 +98,32 @@ class multiviewDiffusionNet:
         kwargs["images_position"] = position_image
 
         if hasattr(self.pipeline.unet, "use_dino") and self.pipeline.unet.use_dino:
-            dino_hidden_states = self.dino_v2(input_images[0])
+            # Check cache first for DINO features
+            if cache is not None and "dino_hidden_states" in cache:
+                print("Reusing cached DINO hidden states.")
+                dino_hidden_states = cache["dino_hidden_states"].to(self.pipeline._execution_device)
+                self.dino_v2.to("cpu") # Make sure dino remains on CPU
+            else:
+                # If not in cache, compute and store them
+                import time
+                dino_device = self.pipeline._execution_device
+                self.dino_v2.to(dino_device)
+                
+                torch.cuda.synchronize()
+                dino_start_time = time.time()
+                
+                dino_hidden_states = self.dino_v2(input_images[0])
+                
+                torch.cuda.synchronize()
+                print(f"[PROFILING] DINO feature extraction took: {time.time() - dino_start_time:.2f}s")
+                
+                self.dino_v2.to("cpu") # Offload DINO back to CPU
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                if cache is not None:
+                    cache["dino_hidden_states"] = dino_hidden_states.cpu() # Store on CPU
+
             kwargs["dino_hidden_states"] = dino_hidden_states
 
         sync_condition = None
@@ -110,6 +135,10 @@ class multiviewDiffusionNet:
             "ShiftSNRScheduler": 15,
         }
 
+        import time
+        torch.cuda.synchronize()
+        pipeline_start_time = time.time()
+        
         mvd_image = self.pipeline(
             input_images[0:1],
             num_inference_steps=infer_steps_dict[self.pipeline.scheduler.__class__.__name__],
@@ -118,6 +147,9 @@ class multiviewDiffusionNet:
             guidance_scale=3.0,
             **kwargs,
         ).images
+
+        torch.cuda.synchronize()
+        print(f"[PROFILING] Main diffusion pipeline call took: {time.time() - pipeline_start_time:.2f}s")
 
         if "pbr" in self.mode:
             mvd_image = {"albedo": mvd_image[:num_view], "mr": mvd_image[num_view:]}

@@ -514,6 +514,16 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         batch_size = hidden_states.shape[0]
 
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
+        
+        # Profiling setup
+        if cross_attention_kwargs.get("profiling_data") is not None:
+            import time
+            profiler = cross_attention_kwargs["profiling_data"]
+            torch.cuda.synchronize()
+            block_start_time = time.time()
+        else:
+            profiler = None
+
         num_in_batch = cross_attention_kwargs.pop("num_in_batch", 1)
         mode = cross_attention_kwargs.pop("mode", None)
         mva_scale = cross_attention_kwargs.pop("mva_scale", 1.0)
@@ -542,13 +552,25 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         else:
             raise ValueError("Incorrect norm used")
 
+        if profiler:
+            torch.cuda.synchronize()
+            norm_start_time = time.time()
+
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
+
+        if profiler:
+            torch.cuda.synchronize()
+            profiler["norm_time"] = profiler.get("norm_time", 0.0) + (time.time() - norm_start_time)
 
         # 1. Prepare GLIGEN inputs
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
+        if profiler:
+            torch.cuda.synchronize()
+            self_attn_start_time = time.time()
+        
         if self.use_mda:
             mda_norm_hidden_states = rearrange(
                 norm_hidden_states, "(b n_pbr n) l c -> b n_pbr n l c", n=num_in_batch, n_pbr=N_pbr
@@ -567,6 +589,10 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
                 attention_mask=attention_mask,
                 **cross_attention_kwargs,
             )
+        
+        if profiler:
+            torch.cuda.synchronize()
+            profiler["self_attn_time"] = profiler.get("self_attn_time", 0.0) + (time.time() - self_attn_start_time)
 
         if self.norm_type == "ada_norm_zero":
             attn_output = gate_msa.unsqueeze(1) * attn_output
@@ -584,6 +610,10 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
             )  # B, (N L), C
 
         if "r" in mode and self.use_ra:
+            if profiler:
+                torch.cuda.synchronize()
+                ref_attn_start_time = time.time()
+
             condition_embed = condition_embed_dict[self.layer_name]
 
             #! Only using albedo features for reference attention
@@ -607,9 +637,18 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
             hidden_states = ref_scale_timing * attn_output + hidden_states
             if hidden_states.ndim == 4:
                 hidden_states = hidden_states.squeeze(1)
+            
+            if profiler:
+                torch.cuda.synchronize()
+                profiler["ref_attn_time"] = profiler.get("ref_attn_time", 0.0) + (time.time() - ref_attn_start_time)
+
 
         # 1.3 Multiview Attention
         if num_in_batch > 1 and self.use_ma:
+            if profiler:
+                torch.cuda.synchronize()
+                mv_attn_start_time = time.time()
+
             multivew_hidden_states = rearrange(
                 norm_hidden_states, "(b n_pbr n) l c -> (b n_pbr) (n l) c", n_pbr=N_pbr, n=num_in_batch
             )
@@ -632,12 +671,19 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
             if hidden_states.ndim == 4:
                 hidden_states = hidden_states.squeeze(1)
 
+            if profiler:
+                torch.cuda.synchronize()
+                profiler["mv_attn_time"] = profiler.get("mv_attn_time", 0.0) + (time.time() - mv_attn_start_time)
+
         # 1.2 GLIGEN Control
         if gligen_kwargs is not None:
             hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
 
         # 3. Cross-Attention
         if self.attn2 is not None:
+            if profiler:
+                torch.cuda.synchronize()
+                norm_start_time = time.time()
             if self.norm_type == "ada_norm":
                 norm_hidden_states = self.norm2(hidden_states, timestep)
             elif self.norm_type in ["ada_norm_zero", "layer_norm", "layer_norm_i2vgen"]:
@@ -654,6 +700,14 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
             if self.pos_embed is not None and self.norm_type != "ada_norm_single":
                 norm_hidden_states = self.pos_embed(norm_hidden_states)
 
+            if profiler:
+                torch.cuda.synchronize()
+                profiler["norm_time"] = profiler.get("norm_time", 0.0) + (time.time() - norm_start_time)
+
+            if profiler:
+                torch.cuda.synchronize()
+                cross_attn_start_time = time.time()
+
             attn_output = self.attn2(
                 norm_hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -661,9 +715,18 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
                 **cross_attention_kwargs,
             )
             hidden_states = attn_output + hidden_states
+            
+            if profiler:
+                torch.cuda.synchronize()
+                profiler["cross_attn_time"] = profiler.get("cross_attn_time", 0.0) + (time.time() - cross_attn_start_time)
+
 
             # dino attn
             if self.use_dino:
+                if profiler:
+                    torch.cuda.synchronize()
+                    dino_attn_start_time = time.time()
+
                 dino_hidden_states = dino_hidden_states.unsqueeze(1).repeat(1, N_pbr * num_in_batch, 1, 1)
                 dino_hidden_states = rearrange(dino_hidden_states, "b n l c -> (b n) l c")
                 attn_output = self.attn_dino(
@@ -674,9 +737,18 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
                 )
 
                 hidden_states = attn_output + hidden_states
+                
+                if profiler:
+                    torch.cuda.synchronize()
+                    profiler["dino_attn_time"] = profiler.get("dino_attn_time", 0.0) + (time.time() - dino_attn_start_time)
+
 
         # 4. Feed-forward
         # i2vgen doesn't have this norm 🤷‍♂️
+        if profiler:
+            torch.cuda.synchronize()
+            norm_start_time = time.time()
+
         if self.norm_type == "ada_norm_continuous":
             norm_hidden_states = self.norm3(hidden_states, added_cond_kwargs["pooled_text_emb"])
         elif not self.norm_type == "ada_norm_single":
@@ -689,6 +761,13 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
             norm_hidden_states = self.norm2(hidden_states)
             norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
 
+        if profiler:
+            torch.cuda.synchronize()
+            profiler["norm_time"] = profiler.get("norm_time", 0.0) + (time.time() - norm_start_time)
+            
+            torch.cuda.synchronize()
+            ff_start_time = time.time()
+            
         if self._chunk_size is not None:
             # "feed_forward_chunk_size" can be used to save memory
             ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
@@ -699,6 +778,12 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
             ff_output = gate_mlp.unsqueeze(1) * ff_output
         elif self.norm_type == "ada_norm_single":
             ff_output = gate_mlp * ff_output
+
+        if profiler:
+            torch.cuda.synchronize()
+            profiler["ff_time"] = profiler.get("ff_time", 0.0) + (time.time() - ff_start_time)
+            profiler["total_block_time"] = profiler.get("total_block_time", 0.0) + (time.time() - block_start_time)
+            profiler["count"] = profiler.get("count", 0) + 1
 
         hidden_states = ff_output + hidden_states
         if hidden_states.ndim == 4:
@@ -1069,7 +1154,19 @@ class UNet2p5DConditionModel(torch.nn.Module):
         mva_scale = cached_condition.get("mva_scale", 1.0)
         ref_scale = cached_condition.get("ref_scale", 1.0)
 
-        return self.unet(
+        cross_attention_kwargs_gen_pass = {
+            "mode": "r",
+            "num_in_batch": N_gen,
+            "dino_hidden_states": dino_hidden_states,
+            "condition_embed_dict": condition_embed_dict,
+            "mva_scale": mva_scale,
+            "ref_scale": ref_scale,
+            "position_voxel_indices": position_voxel_indices,
+        }
+        if "cache" in cached_condition and "profiling_data" in cached_condition["cache"]:
+            cross_attention_kwargs_gen_pass["profiling_data"] = cached_condition["cache"]["profiling_data"]
+
+        result = self.unet(
             sample,
             timestep,
             encoder_hidden_states_gen,
@@ -1090,13 +1187,6 @@ class UNet2p5DConditionModel(torch.nn.Module):
                 mid_block_res_sample.to(dtype=self.unet.dtype) if mid_block_res_sample is not None else None
             ),
             return_dict=False,
-            cross_attention_kwargs={
-                "mode": "r",
-                "num_in_batch": N_gen,
-                "dino_hidden_states": dino_hidden_states,
-                "condition_embed_dict": condition_embed_dict,
-                "mva_scale": mva_scale,
-                "ref_scale": ref_scale,
-                "position_voxel_indices": position_voxel_indices,
-            },
+            cross_attention_kwargs=cross_attention_kwargs_gen_pass,
         )
+        return result

@@ -102,6 +102,7 @@ class Hunyuan3DPaintPipeline:
         else:
             image_prompt = image_path
 
+        time_marker = time.time()
         # Process mesh
         path = os.path.dirname(mesh_path)
         if use_remesh:
@@ -118,6 +119,7 @@ class Hunyuan3DPaintPipeline:
         mesh = trimesh.load(processed_mesh_path)
         mesh = mesh_uv_wrap(mesh)
         self.render.load_mesh(mesh=mesh)
+        print(f"[PROFILING] Mesh Loading & Processing took: {time.time() - time_marker:.2f}s")
 
         ########### View Selection #########
         selected_camera_elevs, selected_camera_azims, selected_view_weights = self.view_processor.bake_view_selection(
@@ -145,13 +147,64 @@ class Hunyuan3DPaintPipeline:
         image_style = [image.convert("RGB") for image in image_style]
 
         ###########  Multiview  ##########
-        multiviews_pbr = self.models["multiview_model"](
-            image_style,
-            normal_maps + position_maps,
-            prompt=image_caption,
-            custom_view_size=self.config.resolution,
-            resize_input=True,
-        )
+        self.load_model("multiview_model")
+        
+        time_marker = time.time()
+        all_multiviews_pbr = {"albedo": [], "mr": []}
+        num_views = len(selected_camera_elevs)
+        chunk_size = self.config.view_chunk_size
+        persistent_cache = {"profiling_data": {}} # Create a cache that will persist across chunks
+
+        # not processing all the views at once
+        for i in tqdm(range(0, num_views, chunk_size), desc="Processing views in chunks", position=0, leave=True):
+            chunk_end = min(i + chunk_size, num_views)
+        
+            # Slice the condition maps for the current chunk
+            chunk_normal_maps = normal_maps[i:chunk_end]
+            chunk_position_maps = position_maps[i:chunk_end]
+
+            print(f"Processing chunk {i//chunk_size + 1}/{(num_views + chunk_size - 1)//chunk_size} with {len(chunk_normal_maps)} views...")
+            
+            chunk_multiviews_pbr = self.models["multiview_model"](
+                image_style,
+                chunk_normal_maps + chunk_position_maps,
+                prompt=image_caption,
+                custom_view_size=self.config.resolution,
+                resize_input=True,
+                cache=persistent_cache
+            )
+            
+            # Append results from the chunk
+            all_multiviews_pbr["albedo"].extend(chunk_multiviews_pbr.get("albedo", []))
+            if "mr" in chunk_multiviews_pbr:
+                all_multiviews_pbr["mr"].extend(chunk_multiviews_pbr.get("mr", []))
+
+            # Aggressive memory clearing between chunks
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        print(f"[PROFILING] Multiview Denoising (UNet) took: {time.time() - time_marker:.2f}s")
+
+        multiviews_pbr = all_multiviews_pbr
+        
+        # Explicitly delete large intermediate tensors that are no longer needed
+        # before offloading the model to maximize freed VRAM.
+        del normal_maps, position_maps, persistent_cache, all_multiviews_pbr
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        # Offload multiview model
+        self.offload_model("multiview_model")
+
+        # Offload the mesh renderer to CPU to free VRAM for super-resolution.
+        print("Offloading mesh renderer to CPU...")
+        self.render.to("cpu")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         ###########  Enhance  ##########
         enhance_images = {}
         enhance_images["albedo"] = copy.deepcopy(multiviews_pbr["albedo"])

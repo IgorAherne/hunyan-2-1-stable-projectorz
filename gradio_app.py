@@ -576,7 +576,7 @@ Fast for very complex cases, Standard seldom use.',
                                                       value=False, min_width=100)
                             export_texture = gr.Checkbox(label='Include Texture', value=False,
                                                          visible=False, min_width=100)
-                        target_face_num = gr.Slider(maximum=1000000, minimum=100, value=10000,
+                        target_face_num = gr.Slider(maximum=1000000, minimum=100, value=8000,
                                                     label='Target Face Number')
                         with gr.Row():
                             confirm_export = gr.Button(value="Transform", min_width=100)

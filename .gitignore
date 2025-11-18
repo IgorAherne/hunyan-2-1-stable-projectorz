@@ -183,3 +183,8 @@ demo_untextured.glb
 white_mesh_remesh.obj
 hy3dpaint/ckpt/
 
+/.vs
+/save_dir
+mr_combined.png
+temp.glb
+hunyuan21_init_done.txt

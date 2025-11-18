@@ -58,7 +58,7 @@ from hy3dpaint.convert_utils import create_glb_with_pbr_materials
 
 # Set to True to skip shape generation and use a placeholder mesh for testing texturing.
 # You must provide a mesh at `assets/debug_mesh.obj` for this to work.
-DEBUG_SKIP_SHAPE_GENERATION = False #MODIF
+DEBUG_SKIP_SHAPE_GENERATION = True #MODIF
 
 MAX_SEED = 1e7
 ENV = "Local" # "Huggingface"

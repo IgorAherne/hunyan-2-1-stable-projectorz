@@ -1,23 +1,10 @@
 # hy3dpaint\hunyuanpaintpbr\unet\modules.py
 
-# Hunyuan 3D is licensed under the TENCENT HUNYUAN NON-COMMERCIAL LICENSE AGREEMENT
-# except for the third-party components listed below.
-# Hunyuan 3D does not impose any additional limitations beyond what is outlined
-# in the repsective licenses of these third-party components.
-# Users must comply with all terms and conditions of original licenses of these third-party
-# components and must ensure that the usage of the third party components adheres to
-# all relevant laws and regulations.
-
-# For avoidance of doubts, Hunyuan 3D means the large language models and
-# their software and algorithms, including trained model weights, parameters (including
-# optimizer states), machine-learning model code, inference-enabling code, training-enabling code,
-# fine-tuning enabling code and other elements of the foregoing made publicly available
-# by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
-
 import os
 import json
 import copy
 import gc
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -33,22 +20,15 @@ from diffusers import (
 from diffusers.models import UNet2DConditionModel
 from diffusers.models.attention_processor import Attention, AttnProcessor
 from diffusers.models.transformers.transformer_2d import BasicTransformerBlock
+from .profiler import BlockProfiler 
 from .attn_processor import SelfAttnProcessor2_0, RefAttnProcessor2_0, PoseRoPEAttnProcessor2_0
 
 from transformers import AutoImageProcessor, AutoModel
 
 
+# -----------------------
+
 class Dino_v2(nn.Module):
-
-    """Wrapper for DINOv2 vision transformer (frozen weights).
-    
-    Provides feature extraction for reference images.
-    
-    Args:
-        dino_v2_path: Custom path to DINOv2 model weights (uses default if None)
-    """
-
-
     def __init__(self, dino_v2_path):
         super(Dino_v2, self).__init__()
         self.dino_processor = AutoImageProcessor.from_pretrained(dino_v2_path)
@@ -60,16 +40,6 @@ class Dino_v2(nn.Module):
         self.dino_v2.eval()
 
     def forward(self, images):
-
-        """Processes input images through DINOv2 ViT.
-        
-        Handles both tensor input (B, N, C, H, W) and PIL image lists.
-        Extracts patch embeddings and flattens spatial dimensions.
-        
-        Returns:
-            torch.Tensor: Feature vectors [B, N*(num_patches), feature_dim]
-        """
-
         if isinstance(images, torch.Tensor):
             batch_size = images.shape[0]
             dino_proceesed_images = self.dino_processor(
@@ -90,22 +60,6 @@ class Dino_v2(nn.Module):
 
 
 def _chunked_feed_forward(ff: nn.Module, hidden_states: torch.Tensor, chunk_dim: int, chunk_size: int):
-    # "feed_forward_chunk_size" can be used to save memory
-
-    """Memory-efficient feedforward execution via chunking.
-    
-    Divides input along specified dimension for sequential processing.
-    
-    Args:
-        ff: Feedforward module to apply
-        hidden_states: Input tensor
-        chunk_dim: Dimension to split
-        chunk_size: Size of each chunk
-        
-    Returns:
-        torch.Tensor: Reassembled output tensor
-    """
-
     if hidden_states.shape[chunk_dim] % chunk_size != 0:
         raise ValueError(
             f"`hidden_states` dimension to be chunked: {hidden_states.shape[chunk_dim]}"
@@ -123,20 +77,6 @@ def _chunked_feed_forward(ff: nn.Module, hidden_states: torch.Tensor, chunk_dim:
 
 @torch.no_grad()
 def compute_voxel_grid_mask(position, grid_resolution=8):
-
-    """Generates view-to-view attention mask based on 3D position similarity.
-    
-    Uses voxel grid downsampling to determine spatially adjacent regions.
-    Mask indicates where features should interact across different views.
-    
-    Args:
-        position: Position maps [B, N, 3, H, W] (normalized 0-1)
-        grid_resolution: Spatial reduction factor
-        
-    Returns:
-        torch.Tensor: Attention mask [B, N*grid_res**2, N*grid_res**2]
-    """
-
     position = position.half()
     B, N, _, H, W = position.shape
     assert H % grid_resolution == 0 and W % grid_resolution == 0
@@ -167,11 +107,10 @@ def compute_voxel_grid_mask(position, grid_resolution=8):
     grid_position = grid_position.permute(0, 1, 4, 2, 3)
     grid_position = rearrange(grid_position, "b n c h w -> b n (h w) c")
 
-    grid_position_expanded_1 = grid_position.unsqueeze(2).unsqueeze(4)  # 形状变为 B, N, 1, L, 1, 3
-    grid_position_expanded_2 = grid_position.unsqueeze(1).unsqueeze(3)  # 形状变为 B, 1, N, 1, L, 3
+    grid_position_expanded_1 = grid_position.unsqueeze(2).unsqueeze(4) 
+    grid_position_expanded_2 = grid_position.unsqueeze(1).unsqueeze(3)
 
-    # 计算欧氏距离
-    distances = torch.norm(grid_position_expanded_1 - grid_position_expanded_2, dim=-1)  # 形状为 B, N, N, L, L
+    distances = torch.norm(grid_position_expanded_1 - grid_position_expanded_2, dim=-1) 
 
     weights = distances
     grid_distance = 1.73 / grid_resolution
@@ -181,19 +120,6 @@ def compute_voxel_grid_mask(position, grid_resolution=8):
 
 
 def compute_multi_resolution_mask(position_maps, grid_resolutions=[32, 16, 8]):
-
-    """Generates attention masks at multiple spatial resolutions.
-    
-    Creates pyramid of position-based masks for hierarchical attention.
-    
-    Args:
-        position_maps: Position maps [B, N, 3, H, W]
-        grid_resolutions: List of downsampling factors
-        
-    Returns:
-        dict: Resolution-specific masks keyed by flattened dimension size
-    """
-
     position_attn_mask = {}
     with torch.no_grad():
         for grid_resolution in grid_resolutions:
@@ -205,20 +131,6 @@ def compute_multi_resolution_mask(position_maps, grid_resolutions=[32, 16, 8]):
 
 @torch.no_grad()
 def compute_discrete_voxel_indice(position, grid_resolution=8, voxel_resolution=128):
-
-    """Quantizes position maps to discrete voxel indices.
-    
-    Creates sparse 3D coordinate representations for efficient hashing.
-    
-    Args:
-        position: Position maps [B, N, 3, H, W]
-        grid_resolution: Spatial downsampling factor
-        voxel_resolution: Quantization resolution
-        
-    Returns:
-        torch.Tensor: Voxel indices [B, N, grid_res, grid_res, 3]
-    """
-
     position = position.half()
     B, N, _, H, W = position.shape
     assert H % grid_resolution == 0 and W % grid_resolution == 0
@@ -247,27 +159,13 @@ def compute_discrete_voxel_indice(position, grid_resolution=8, voxel_resolution=
     voxel_mask_thres = (H // grid_resolution) * (W // grid_resolution) // (4 * 4)
     grid_position[count_masked < voxel_mask_thres] = 0
 
-    grid_position = grid_position.permute(0, 1, 4, 2, 3).clamp(0, 1)  # B N C H W
+    grid_position = grid_position.permute(0, 1, 4, 2, 3).clamp(0, 1)
     voxel_indices = grid_position * (voxel_resolution - 1)
     voxel_indices = torch.round(voxel_indices).long()
     return voxel_indices
 
 
 def calc_multires_voxel_idxs(position_maps, grid_resolutions=[64, 32, 16, 8], voxel_resolutions=[512, 256, 128, 64]):
-
-    """Generates multi-resolution voxel indices for position encoding.
-    
-    Creates pyramid of quantized position representations.
-    
-    Args:
-        position_maps: Input position maps
-        grid_resolutions: Spatial resolution levels
-        voxel_resolutions: Quantization levels
-        
-    Returns:
-        dict: Voxel indices keyed by flattened dimension size, with resolution metadata
-    """
-
     voxel_indices = {}
     with torch.no_grad():
         for grid_resolution, voxel_resolution in zip(grid_resolutions, voxel_resolutions):
@@ -278,26 +176,6 @@ def calc_multires_voxel_idxs(position_maps, grid_resolutions=[64, 32, 16, 8], vo
 
 
 class Basic2p5DTransformerBlock(torch.nn.Module):
-
-
-    """Enhanced transformer block for multiview 2.5D image generation.
-    
-    Extends standard transformer blocks with:
-    - Material-specific attention (MDA)
-    - Multiview attention (MA)
-    - Reference attention (RA)
-    - DINO feature integration
-    
-    Args:
-        transformer: Base transformer block
-        layer_name: Identifier for layer
-        use_ma: Enable multiview attention
-        use_ra: Enable reference attention
-        use_mda: Enable material-aware attention
-        use_dino: Enable DINO feature integration
-        pbr_setting: List of PBR materials
-    """
-
     def __init__(
         self,
         transformer: BasicTransformerBlock,
@@ -308,26 +186,6 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         use_dino=True,
         pbr_setting=None,
     ) -> None:
-        
-        """
-        Initialization:
-        1. Material-Dimension Attention (MDA):
-           - Processes each PBR material with separate projection weights
-           - Uses custom SelfAttnProcessor2_0 with material awareness
-           
-        2. Multiview Attention (MA):
-           - Adds cross-view attention with PoseRoPE
-           - Initialized as zero-initialized residual pathway
-           
-        3. Reference Attention (RA):
-           - Conditions on reference view features
-           - Uses RefAttnProcessor2_0 for material-specific conditioning
-           
-        4. DINO Attention:
-           - Incorporates DINO-ViT features
-           - Initialized as zero-initialized residual pathway
-        """
-
         super().__init__()
         self.transformer = transformer
         self.layer_name = layer_name
@@ -352,7 +210,6 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
                 )
             )
 
-        # multiview attn
         if self.use_ma:
             self.attn_multiview = Attention(
                 query_dim=self.dim,
@@ -366,7 +223,6 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
                 processor=PoseRoPEAttnProcessor2_0(),
             )
 
-        # ref attn
         if self.use_ra:
             self.attn_refview = Attention(
                 query_dim=self.dim,
@@ -390,7 +246,6 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
                 ),
             )
 
-        # dino attn
         if self.use_dino:
             self.attn_dino = Attention(
                 query_dim=self.dim,
@@ -406,14 +261,6 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         self._initialize_attn_weights()
 
     def _initialize_attn_weights(self):
-
-        """Initializes specialized attention heads with base weights.
-        
-        Uses weight sharing strategy:
-        - Copies base transformer weights to specialized heads
-        - Initializes newly-added parameters to zero
-        """
-
         if self.use_mda:
             for token in self.pbr_setting:
                 if token == "albedo":
@@ -459,13 +306,6 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
                     for param in layer.parameters():
                         param.zero_()
 
-        if self.use_dino:
-            self.attn_dino.load_state_dict(self.attn2.state_dict(), strict=False)
-            with torch.no_grad():
-                for layer in self.attn_dino.to_out:
-                    for param in layer.parameters():
-                        param.zero_()
-
     def __getattr__(self, name: str):
         try:
             return super().__getattr__(name)
@@ -484,48 +324,17 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
 
-        """Forward pass with multi-mechanism attention.
-        
-        Processing stages:
-        1. Material-aware self-attention (MDA)
-        2. Reference attention (RA)
-        3. Multiview attention (MA) with position-aware attention
-        4. Text conditioning (base attention)
-        5. DINO feature conditioning (optional)
-        6. Position-aware conditioning
-        7. Feed-forward network
-        
-        Args:
-            hidden_states: Input features [B * N_materials * N_views, Seq_len, Feat_dim]
-            See base transformer for other parameters
-            
-        Returns:
-            torch.Tensor: Output features
-        """
-        # [Full multi-mechanism processing pipeline...]
-        # Key processing stages:
-        # 1. Material-aware self-attention (handles albedo/mr separation)
-        # 2. Reference attention (conditioned on reference features)
-        # 3. View-to-view attention with geometric constraints
-        # 4. Text-to-image cross-attention
-        # 5. DINO feature fusion (when enabled)
-        # 6. Positional conditioning (RoPE-style)
-        # 7. Feed-forward network with conditional normalization
-
-        # Notice that normalization is always applied before the real computation in the following blocks.
-        # 0. Self-Attention
         batch_size = hidden_states.shape[0]
-
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
-        
-        # Profiling setup
-        if cross_attention_kwargs.get("profiling_data") is not None:
-            import time
-            profiler = cross_attention_kwargs["profiling_data"]
+
+        # --- PROFILING ---
+        profiling = BlockProfiler.enabled
+        if profiling:
             torch.cuda.synchronize()
             block_start_time = time.time()
-        else:
-            profiler = None
+            # Pass the profiler dict to attention processors via kwargs
+            cross_attention_kwargs["profiling_data"] = BlockProfiler.data
+        # -----------------
 
         num_in_batch = cross_attention_kwargs.pop("num_in_batch", 1)
         mode = cross_attention_kwargs.pop("mode", None)
@@ -535,6 +344,11 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         dino_hidden_states = cross_attention_kwargs.pop("dino_hidden_states", None)
         position_voxel_indices = cross_attention_kwargs.pop("position_voxel_indices", None)
         N_pbr = len(self.pbr_setting) if self.pbr_setting is not None else 1
+
+        # 0. Norm
+        if profiling:
+            torch.cuda.synchronize()
+            t0 = time.time()
 
         if self.norm_type == "ada_norm":
             norm_hidden_states = self.norm1(hidden_states, timestep)
@@ -555,25 +369,18 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         else:
             raise ValueError("Incorrect norm used")
 
-        if profiler:
-            torch.cuda.synchronize()
-            norm_start_time = time.time()
-
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
-        if profiler:
+        if profiling:
             torch.cuda.synchronize()
-            profiler["norm_time"] = profiler.get("norm_time", 0.0) + (time.time() - norm_start_time)
+            BlockProfiler.data["norm_time"] += time.time() - t0
 
-        # 1. Prepare GLIGEN inputs
-        cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
-        gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
-
-        if profiler:
+        # 1. Self Attention (MDA)
+        if profiling:
             torch.cuda.synchronize()
-            self_attn_start_time = time.time()
-        
+            t0 = time.time()
+
         if self.use_mda:
             mda_norm_hidden_states = rearrange(
                 norm_hidden_states, "(b n_pbr n) l c -> b n_pbr n l c", n=num_in_batch, n_pbr=N_pbr
@@ -593,9 +400,9 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
                 **cross_attention_kwargs,
             )
         
-        if profiler:
+        if profiling:
             torch.cuda.synchronize()
-            profiler["self_attn_time"] = profiler.get("self_attn_time", 0.0) + (time.time() - self_attn_start_time)
+            BlockProfiler.data["self_attn_time"] += time.time() - t0
 
         if self.norm_type == "ada_norm_zero":
             attn_output = gate_msa.unsqueeze(1) * attn_output
@@ -610,22 +417,20 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         if "w" in mode:
             condition_embed_dict[self.layer_name] = rearrange(
                 norm_hidden_states, "(b n) l c -> b (n l) c", n=num_in_batch
-            )  # B, (N L), C
+            ) 
 
         if "r" in mode and self.use_ra:
-            if profiler:
+            if profiling:
                 torch.cuda.synchronize()
-                ref_attn_start_time = time.time()
+                t0 = time.time()
 
             condition_embed = condition_embed_dict[self.layer_name]
 
-            #! Only using albedo features for reference attention
+            # Only using albedo features for reference attention
             ref_norm_hidden_states = rearrange(
                 norm_hidden_states, "(b n_pbr n) l c -> b n_pbr (n l) c", n=num_in_batch, n_pbr=N_pbr
             )[:, 0, ...]
 
-            # The `condition_embed` tensor comes from a CPU cache, so it must be moved to the
-            # same device as the `hidden_states` before being used in the attention mechanism.
             condition_embed = condition_embed.to(hidden_states.device)
 
             attn_output = self.attn_refview(
@@ -633,12 +438,11 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
                 encoder_hidden_states=condition_embed,
                 attention_mask=None,
                 **cross_attention_kwargs,
-            )  # b (n l) c
+            ) 
             
-            # Explicitly delete the large tensor and suggest a cache clear to reduce the VRAM hump
+            # Cleanup large tensor
             del condition_embed
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # if torch.cuda.is_available(): torch.cuda.empty_cache() # Avoid frequent cache clearing in inner loop
 
             attn_output = rearrange(attn_output, "b n_pbr (n l) c -> (b n_pbr n) l c", n=num_in_batch, n_pbr=N_pbr)
 
@@ -651,16 +455,16 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
             if hidden_states.ndim == 4:
                 hidden_states = hidden_states.squeeze(1)
             
-            if profiler:
+            if profiling:
                 torch.cuda.synchronize()
-                profiler["ref_attn_time"] = profiler.get("ref_attn_time", 0.0) + (time.time() - ref_attn_start_time)
+                BlockProfiler.data["ref_attn_time"] += time.time() - t0
 
 
         # 1.3 Multiview Attention
         if num_in_batch > 1 and self.use_ma:
-            if profiler:
+            if profiling:
                 torch.cuda.synchronize()
-                mv_attn_start_time = time.time()
+                t0 = time.time()
 
             multivew_hidden_states = rearrange(
                 norm_hidden_states, "(b n_pbr n) l c -> (b n_pbr) (n l) c", n_pbr=N_pbr, n=num_in_batch
@@ -684,42 +488,35 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
             if hidden_states.ndim == 4:
                 hidden_states = hidden_states.squeeze(1)
 
-            if profiler:
+            if profiling:
                 torch.cuda.synchronize()
-                profiler["mv_attn_time"] = profiler.get("mv_attn_time", 0.0) + (time.time() - mv_attn_start_time)
-
-        # 1.2 GLIGEN Control
-        if gligen_kwargs is not None:
-            hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
+                BlockProfiler.data["mv_attn_time"] += time.time() - t0
 
         # 3. Cross-Attention
         if self.attn2 is not None:
-            if profiler:
+            if profiling:
                 torch.cuda.synchronize()
-                norm_start_time = time.time()
+                t0 = time.time()
+
             if self.norm_type == "ada_norm":
                 norm_hidden_states = self.norm2(hidden_states, timestep)
             elif self.norm_type in ["ada_norm_zero", "layer_norm", "layer_norm_i2vgen"]:
                 norm_hidden_states = self.norm2(hidden_states)
             elif self.norm_type == "ada_norm_single":
-                # For PixArt norm2 isn't applied here:
-                # https://github.com/PixArt-alpha/PixArt-alpha/blob/0f55e922376d8b797edd44d25d0e7464b260dcab/diffusion/model/nets/PixArtMS.py#L70C1-L76C103
                 norm_hidden_states = hidden_states
             elif self.norm_type == "ada_norm_continuous":
                 norm_hidden_states = self.norm2(hidden_states, added_cond_kwargs["pooled_text_emb"])
             else:
-                raise ValueError("Incorrect norm")
+                raise ValueError("Incorrect norm used")
 
             if self.pos_embed is not None and self.norm_type != "ada_norm_single":
                 norm_hidden_states = self.pos_embed(norm_hidden_states)
 
-            if profiler:
+            if profiling:
                 torch.cuda.synchronize()
-                profiler["norm_time"] = profiler.get("norm_time", 0.0) + (time.time() - norm_start_time)
-
-            if profiler:
+                BlockProfiler.data["norm_time"] += time.time() - t0
                 torch.cuda.synchronize()
-                cross_attn_start_time = time.time()
+                t0 = time.time()
 
             attn_output = self.attn2(
                 norm_hidden_states,
@@ -729,38 +526,35 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
             )
             hidden_states = attn_output + hidden_states
             
-            if profiler:
+            if profiling:
                 torch.cuda.synchronize()
-                profiler["cross_attn_time"] = profiler.get("cross_attn_time", 0.0) + (time.time() - cross_attn_start_time)
-
+                BlockProfiler.data["cross_attn_time"] += time.time() - t0
 
             # dino attn
             if self.use_dino:
-                if profiler:
+                if profiling:
                     torch.cuda.synchronize()
-                    dino_attn_start_time = time.time()
+                    t0 = time.time()
 
-                dino_hidden_states = dino_hidden_states.unsqueeze(1).repeat(1, N_pbr * num_in_batch, 1, 1)
-                dino_hidden_states = rearrange(dino_hidden_states, "b n l c -> (b n) l c")
+                dino_hidden_states_input = dino_hidden_states.unsqueeze(1).repeat(1, N_pbr * num_in_batch, 1, 1)
+                dino_hidden_states_input = rearrange(dino_hidden_states_input, "b n l c -> (b n) l c")
                 attn_output = self.attn_dino(
                     norm_hidden_states,
-                    encoder_hidden_states=dino_hidden_states,
+                    encoder_hidden_states=dino_hidden_states_input,
                     attention_mask=None,
                     **cross_attention_kwargs,
                 )
 
                 hidden_states = attn_output + hidden_states
                 
-                if profiler:
+                if profiling:
                     torch.cuda.synchronize()
-                    profiler["dino_attn_time"] = profiler.get("dino_attn_time", 0.0) + (time.time() - dino_attn_start_time)
-
+                    BlockProfiler.data["dino_attn_time"] += time.time() - t0
 
         # 4. Feed-forward
-        # i2vgen doesn't have this norm 🤷‍♂️
-        if profiler:
+        if profiling:
             torch.cuda.synchronize()
-            norm_start_time = time.time()
+            t0 = time.time()
 
         if self.norm_type == "ada_norm_continuous":
             norm_hidden_states = self.norm3(hidden_states, added_cond_kwargs["pooled_text_emb"])
@@ -774,15 +568,13 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
             norm_hidden_states = self.norm2(hidden_states)
             norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
 
-        if profiler:
+        if profiling:
             torch.cuda.synchronize()
-            profiler["norm_time"] = profiler.get("norm_time", 0.0) + (time.time() - norm_start_time)
-            
+            BlockProfiler.data["norm_time"] += time.time() - t0
             torch.cuda.synchronize()
-            ff_start_time = time.time()
+            t0 = time.time()
             
         if self._chunk_size is not None:
-            # "feed_forward_chunk_size" can be used to save memory
             ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
         else:
             ff_output = self.ff(norm_hidden_states)
@@ -792,11 +584,11 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         elif self.norm_type == "ada_norm_single":
             ff_output = gate_mlp * ff_output
 
-        if profiler:
+        if profiling:
             torch.cuda.synchronize()
-            profiler["ff_time"] = profiler.get("ff_time", 0.0) + (time.time() - ff_start_time)
-            profiler["total_block_time"] = profiler.get("total_block_time", 0.0) + (time.time() - block_start_time)
-            profiler["count"] = profiler.get("count", 0) + 1
+            BlockProfiler.data["ff_time"] += time.time() - t0
+            BlockProfiler.data["total_block_time"] += time.time() - block_start_time
+            BlockProfiler.data["count"] += 1
 
         hidden_states = ff_output + hidden_states
         if hidden_states.ndim == 4:
@@ -806,20 +598,8 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
 
 
 class ImageProjModel(torch.nn.Module):
-
-    """Projects image embeddings into cross-attention space.
-    
-    Transforms CLIP embeddings into additional context tokens for conditioning.
-    
-    Args:
-        cross_attention_dim: Dimension of attention space
-        clip_embeddings_dim: Dimension of input CLIP embeddings
-        clip_extra_context_tokens: Number of context tokens to generate
-    """
-
     def __init__(self, cross_attention_dim=1024, clip_embeddings_dim=1024, clip_extra_context_tokens=4):
         super().__init__()
-
         self.generator = None
         self.cross_attention_dim = cross_attention_dim
         self.clip_extra_context_tokens = clip_extra_context_tokens
@@ -827,16 +607,6 @@ class ImageProjModel(torch.nn.Module):
         self.norm = torch.nn.LayerNorm(cross_attention_dim)
 
     def forward(self, image_embeds):
-
-        """Projects image embeddings to cross-attention context tokens.
-        
-        Args:
-            image_embeds: Input embeddings [B, N, C] or [B, C]
-            
-        Returns:
-            torch.Tensor: Context tokens [B, N*clip_extra_context_tokens, cross_attention_dim]
-        """
-
         embeds = image_embeds
         num_token = 1
         if embeds.dim() == 3:
@@ -854,21 +624,6 @@ class ImageProjModel(torch.nn.Module):
 
 
 class UNet2p5DConditionModel(torch.nn.Module):
-
-    """2.5D UNet extension for multiview PBR generation.
-    
-    Enhances standard 2D UNet with:
-    - Multiview attention mechanisms
-    - Material-aware processing
-    - Position-aware conditioning
-    - Dual-stream reference processing
-    
-    Args:
-        unet: Base 2D UNet model
-        train_sched: Training scheduler (DDPM)
-        val_sched: Validation scheduler (EulerAncestral)
-    """
-
     def __init__(
         self,
         unet: UNet2DConditionModel,
@@ -929,17 +684,6 @@ class UNet2p5DConditionModel(torch.nn.Module):
         return unet_2p5d
 
     def init_condition(self, use_dino):
-
-        """Initializes conditioning mechanisms for multiview PBR generation.
-        
-        Sets up:
-        1. Learned text embeddings: Material-specific tokens (albedo, mr) initialized to zeros
-        2. DINO projector: Model to process DINO-ViT features for cross-attention
-        
-        Args:
-            use_dino: Flag to enable DINO feature integration
-        """
-
         if self.use_learned_text_clip:
             for token in self.pbr_setting:
                 self.unet.register_parameter(
@@ -955,23 +699,6 @@ class UNet2p5DConditionModel(torch.nn.Module):
             )
 
     def init_attention(self, unet, use_ma=False, use_ra=False, use_mda=False, use_dino=False, pbr_setting=None):
-
-        """Recursively replaces standard transformers with enhanced 2.5D blocks.
-        
-        Processes UNet architecture:
-        1. Downsampling blocks: Replaces transformers in attention layers
-        2. Middle block: Upgrades central transformers
-        3. Upsampling blocks: Modifies decoder transformers
-        
-        Args:
-            unet: UNet model to enhance
-            use_ma: Enable multiview attention
-            use_ra: Enable reference attention
-            use_mda: Enable material-specific attention
-            use_dino: Enable DINO feature integration
-            pbr_setting: List of PBR materials
-        """
-
         for down_block_i, down_block in enumerate(unet.down_blocks):
             if hasattr(down_block, "has_cross_attention") and down_block.has_cross_attention:
                 for attn_i, attn in enumerate(down_block.attentions):
@@ -1029,31 +756,6 @@ class UNet2p5DConditionModel(torch.nn.Module):
         mid_block_res_sample=None,
         **cached_condition,
     ):
-
-        """Forward pass with multiview/material conditioning.
-        
-        Key stages:
-        1. Input preparation (concat normal/position maps)
-        2. Reference feature extraction (dual-stream)
-        3. Position encoding (voxel indices)
-        4. DINO feature projection
-        5. Main UNet processing with attention conditioning
-        
-        Args:
-            sample: Input latents [B, N_pbr, N_gen, C, H, W]
-            cached_condition: Dictionary containing:
-                - embeds_normal: Normal map embeddings
-                - embeds_position: Position map embeddings
-                - ref_latents: Reference image latents
-                - dino_hidden_states: DINO features
-                - position_maps: 3D position maps
-                - mva_scale: Multiview attention scale
-                - ref_scale: Reference attention scale
-                
-        Returns:
-            torch.Tensor: Output features
-        """
-
         B, N_pbr, N_gen, _, H, W = sample.shape
         assert H == W
 
@@ -1165,7 +867,6 @@ class UNet2p5DConditionModel(torch.nn.Module):
                     encoder_hidden_states=encoder_hidden_states_ref,
                     class_labels=None,
                     added_cond_kwargs=added_cond_kwargs_ref,
-                    # **kwargs
                     return_dict=False,
                     cross_attention_kwargs={
                         "mode": "w",
@@ -1173,7 +874,6 @@ class UNet2p5DConditionModel(torch.nn.Module):
                         "condition_embed_dict": condition_embed_dict,
                     },
                 )
-                # After the reference pass, move the generated tensors to CPU before caching
                 for k in condition_embed_dict:
                     if isinstance(condition_embed_dict[k], torch.Tensor):
                         condition_embed_dict[k] = condition_embed_dict[k].cpu()
@@ -1181,17 +881,11 @@ class UNet2p5DConditionModel(torch.nn.Module):
                 if "ref_latents" in cached_condition:
                     del cached_condition["ref_latents"]
                 
-                # Aggressively clear VRAM after the reference pass is complete.
-                # Manually offload the reference UNet to CPU, as its job is done for this step.
                 unet_ref.to("cpu")
-                
-                # Delete all other large tensors from the reference pass that are no longer needed.
                 del unet_ref, noisy_ref_latents, encoder_hidden_states_ref
                 if 'added_cond_kwargs_ref' in locals():
                     del added_cond_kwargs_ref
                 
-                # Force garbage collection and empty the CUDA cache to maximize available VRAM
-                # before the main denoising pass begins.
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -1210,8 +904,7 @@ class UNet2p5DConditionModel(torch.nn.Module):
             "ref_scale": ref_scale,
             "position_voxel_indices": position_voxel_indices,
         }
-        if "cache" in cached_condition and "profiling_data" in cached_condition["cache"]:
-            cross_attention_kwargs_gen_pass["profiling_data"] = cached_condition["cache"]["profiling_data"]
+        # No longer need to manually pass profiler via dict, the global class handles it.
 
         result = self.unet(
             sample,

@@ -49,6 +49,7 @@ from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
 from .unet.modules import UNet2p5DConditionModel
+from .unet.profiler import BlockProfiler 
 from .unet.attn_processor import SelfAttnProcessor2_0, RefAttnProcessor2_0, PoseRoPEAttnProcessor2_0
 
 __all__ = [
@@ -662,6 +663,10 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
         
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+
+        BlockProfiler.reset()
+        BlockProfiler.enable()
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -770,30 +775,54 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
         
+        BlockProfiler.disable()
+        
         print(f"\n[PROFILING] Denoise Loop Summary:")
         print(f"  - Total UNet time:            {unet_time_total:.2f}s ({unet_time_total/num_inference_steps:.3f}s/step)")
         print(f"  - Total Guidance time:        {guidance_time_total:.2f}s ({guidance_time_total/num_inference_steps:.3f}s/step)")
         print(f"  - Total Scheduler Step time:  {scheduler_step_time_total:.2f}s ({scheduler_step_time_total/num_inference_steps:.3f}s/step)")
         
-        if "profiling_data" in kwargs["cache"]:
-            profiler = kwargs["cache"]["profiling_data"]
-            count = profiler.get("count", 1)
-            total_time = profiler.get('total_block_time', 0.0)
-            if count > 0 and total_time > 0:
-                print("\n--- UNet Block Profiling Summary ---")
-                print(f"Total blocks executed: {count}")
-                print(f"Avg time per block: {total_time / count * 1000:.2f} ms")
-                
-                # Sort items by time contribution
-                sorted_times = sorted(
-                    [(k, v) for k, v in profiler.items() if "time" in k and k != "total_block_time"],
-                    key=lambda item: item[1],
-                    reverse=True
-                )
+        # Get data from global profiler
+        profiler_data = BlockProfiler.get_summary()
+        count = profiler_data.get("count", 0)
+        total_time = profiler_data.get('total_block_time', 0.0)
+        
+        if count > 0 and total_time > 0:
+            print("\n--- UNet Block Profiling Summary ---")
+            print(f"Total blocks executed: {count}")
+            print(f"Avg time per block: {total_time / count * 1000:.2f} ms")
+            
+            block_items = {
+                "self_attn": "Self Attention", "ref_attn": "Reference Attention", "mv_attn": "MultiView Attention",
+                "cross_attn": "Cross Attention", "dino_attn": "DINO Attention", "ff": "Feed Forward", "norm": "Normalization"
+            }
+            
+            print("\n  Block-level Breakdown:")
+            for key, name in block_items.items():
+                value = profiler_data.get(f"{key}_time", 0.0)
+                if value > 0:
+                    print(f"    - Avg {name:<20}: {value / count * 1000:.2f} ms ({(value/total_time)*100:.1f}%)")
 
-                for key, value in sorted_times:
-                    print(f"  - Avg {key.replace('_time', ''):<15}: {value / count * 1000:.2f} ms ({(value/total_time)*100:.1f}%)")
-                print("------------------------------------")
+            # Granular Attention Breakdown
+            # FIX: Use 'profiler_data', not 'profiler'
+            attn_total_time = profiler_data.get("qkv_proj_time", 0.0) + profiler_data.get("sdpa_time", 0.0) + profiler_data.get("rope_time", 0.0)
+            if attn_total_time > 0:
+                print("\n  Attention Mechanism Breakdown (Avg per call):")
+                attn_calls = profiler_data.get("sdpa_time_count", 1) 
+                qkv_time = profiler_data.get("qkv_proj_time", 0.0)
+                sdpa_time = profiler_data.get("sdpa_time", 0.0)
+                rope_time = profiler_data.get("rope_time", 0.0)
+                
+                if attn_calls > 0:
+                    print(f"    - QKV Projection: {qkv_time / attn_calls * 1000:.2f} ms ({(qkv_time/attn_total_time)*100:.1f}%)")
+                    print(f"    - SDPA/FlashAttn: {sdpa_time / attn_calls * 1000:.2f} ms ({(sdpa_time/attn_total_time)*100:.1f}%)")
+                    if rope_time > 0:
+                        print(f"    - RoPE:           {rope_time / attn_calls * 1000:.2f} ms ({(rope_time/attn_total_time)*100:.1f}%)")
+
+            print("------------------------------------")
+        else:
+            print("\n[PROFILING DIAGNOSTIC] UNet Block Profiling Summary was not printed because the profiler dictionary was empty.")
+            print(f"  - Profiler content: {profiler_data}")
 
         if not output_type == "latent":
             # Chunk the VAE decoding process to reduce peak memory

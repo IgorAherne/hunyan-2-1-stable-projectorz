@@ -21,6 +21,8 @@ from typing import Optional, Dict, Tuple, Union, Literal, List, Callable
 from einops import rearrange
 from diffusers.utils import deprecate
 from diffusers.models.attention_processor import Attention, AttnProcessor
+from .profiler import BlockProfiler 
+import time
 
 try:
     import flash_attn
@@ -519,6 +521,9 @@ class AttnCore:
             Tuple containing (attention_output, residual, input_ndim, shape_info,
             batch_size, num_heads, head_dim)
         """
+        # Check global profiler state
+        profiling = BlockProfiler.enabled
+
         # Prepare hidden states
         hidden_states, residual, input_ndim, shape_info = AttnUtils.prepare_hidden_states(hidden_states, attn, temb)
 
@@ -535,7 +540,15 @@ class AttnCore:
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
 
+        if profiling:
+            torch.cuda.synchronize()
+            qkv_start_time = time.time()
+
         query, key, value = get_qkv_fn(attn, hidden_states, encoder_hidden_states, **kwargs)
+
+        if profiling:
+            torch.cuda.synchronize()
+            BlockProfiler.data["qkv_proj_time"] += (time.time() - qkv_start_time)
 
         # Reshape for attention
         inner_dim = key.shape[-1]
@@ -548,9 +561,17 @@ class AttnCore:
         # Apply normalization
         query, key = AttnUtils.apply_norms(query, key, getattr(attn, "norm_q", None), getattr(attn, "norm_k", None))
 
-        # Apply RoPE if provided
+        # Apply RoPE
         if apply_rope_fn is not None:
+            if profiling:
+                torch.cuda.synchronize()
+                rope_start_time = time.time()
+            
             query, key = apply_rope_fn(query, key, head_dim, **kwargs)
+
+            if profiling:
+                torch.cuda.synchronize()
+                BlockProfiler.data["rope_time"] += (time.time() - rope_start_time)
 
         # Check if FlashAttention can be used
         # It requires float16/bfloat16 and no attention mask.
@@ -560,6 +581,11 @@ class AttnCore:
             and query.dtype in [torch.float16, torch.bfloat16]
             and attention_mask is None
         )
+
+        if profiling:
+            torch.cuda.synchronize()
+            sdpa_start_time = time.time()
+            BlockProfiler.data["sdpa_time_count"] += 1
 
         if use_flash_attention:
             # FlashAttention requires the shape (batch_size, seq_len, num_heads, head_dim)
@@ -580,6 +606,10 @@ class AttnCore:
                 query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
             )
 
+        if profiling:
+            torch.cuda.synchronize()
+            BlockProfiler.data["sdpa_time"] += (time.time() - sdpa_start_time)
+            
         return hidden_states, residual, input_ndim, shape_info, batch_size, attn.heads, head_dim
 
 
@@ -660,6 +690,7 @@ class PoseRoPEAttnProcessor2_0:
             apply_rope_fn=apply_rope,
             position_indices=position_indices,
             n_pbrs=n_pbrs,
+            **kwargs,
         )
 
         # Finalize output
@@ -734,7 +765,7 @@ class SelfAttnProcessor2_0(BaseAttnProcessor):
 
         # Core processing using shared logic
         hidden_states, residual, input_ndim, shape_info, batch_size, heads, head_dim = AttnCore.process_attention_base(
-            attn, hidden_states, encoder_hidden_states, attention_mask, temb, get_qkv_fn=get_qkv
+            attn, hidden_states, encoder_hidden_states, attention_mask, temb, get_qkv_fn=get_qkv, **kwargs
         )
 
         # Finalize
@@ -782,7 +813,7 @@ class SelfAttnProcessor2_0(BaseAttnProcessor):
         results = []
         for token, pbr_hs in zip(self.pbr_setting, pbr_hidden_states):
             processed_hs = rearrange(pbr_hs, "b n_pbrs n l c -> (b n_pbrs n) l c").to("cuda:0")
-            result = self.process_single(attn, processed_hs, None, attention_mask, temb, token, False)
+            result = self.process_single(attn, processed_hs, None, attention_mask, temb, token, False, **kwargs)
             results.append(result)
 
         outputs = [rearrange(result, "(b n_pbrs n) l c -> b n_pbrs n l c", b=B, n_pbrs=1) for result in results]
@@ -860,6 +891,7 @@ class RefAttnProcessor2_0(BaseAttnProcessor):
             temb,
             get_qkv_fn=get_qkv,
             disable_flash_attention=True,
+            **kwargs,
         )
 
         # Split and process each PBR setting output

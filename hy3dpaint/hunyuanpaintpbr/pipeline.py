@@ -1,4 +1,4 @@
-# hy3dpaint\hunyuanpaintpbr\modules.py
+# hy3dpaint\hunyuanpaintpbr\pipeline.py
 
 # Hunyuan 3D is licensed under the TENCENT HUNYUAN NON-COMMERCIAL LICENSE AGREEMENT
 # except for the third-party components listed below.
@@ -159,6 +159,9 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
         Returns:
             torch.Tensor: Latent representations [B, N_views, C, H_latent, W_latent]
         """
+        import time
+        torch.cuda.synchronize()
+        vae_encode_start_time = time.time()
 
         B = images.shape[0]
         images = rearrange(images, "b n c h w -> (b n) c h w")
@@ -169,6 +172,10 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
         latents = posterior.sample() * self.vae.config.scaling_factor
 
         latents = rearrange(latents, "(b n) c h w -> b n c h w", b=B)
+        
+        torch.cuda.synchronize()
+        print(f"[PROFILING] VAE Encode for shape {images.shape} took: {time.time() - vae_encode_start_time:.2f}s")
+        
         return latents
 
     @torch.no_grad()
@@ -521,7 +528,6 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
 
         cache = kwargs.pop("cache", None)
         kwargs["cache"] = cache if cache is not None else {}
-        print("using cache")
 
         if callback is not None:
             deprecate(
@@ -649,6 +655,11 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
             ).to(device=device, dtype=latents.dtype)
 
         # 7. Denoising loop
+        import time
+        unet_time_total = 0.0
+        guidance_time_total = 0.0
+        scheduler_step_time_total = 0.0
+        
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -670,6 +681,8 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
                 )
 
                 # predict the noise residual
+                torch.cuda.synchronize()
+                unet_start_time = time.time()
 
                 noise_pred = self.unet(
                     latent_model_input,
@@ -681,9 +694,16 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
                     return_dict=False,
                     **kwargs,
                 )[0]
+                
+                torch.cuda.synchronize()
+                unet_time_total += time.time() - unet_start_time
+                
                 latents = rearrange(latents, "b n_pbr n c h w -> (b n_pbr n) c h w")
 
                 # perform guidance
+                torch.cuda.synchronize()
+                guidance_start_time = time.time()
+                
                 if self.do_classifier_free_guidance:
                     # noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     # noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
@@ -713,15 +733,24 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
                         noise_pred_ref - noise_pred_uncond
                     )
                     noise_pred += self.guidance_scale * view_scale_tensor * (noise_pred_full - noise_pred_ref)
+                
+                torch.cuda.synchronize()
+                guidance_time_total += time.time() - guidance_start_time
 
                 if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
                     noise_pred = rescale_noise_cfg(noise_pred, noise_pred_ref, guidance_rescale=self.guidance_rescale)
 
                 # compute the previous noisy sample x_t -> x_t-1
+                torch.cuda.synchronize()
+                scheduler_step_start_time = time.time()
+                
                 latents = self.scheduler.step(
                     noise_pred, t, latents[:, :num_channels_latents, :, :], **extra_step_kwargs, return_dict=False
                 )[0]
+                
+                torch.cuda.synchronize()
+                scheduler_step_time_total += time.time() - scheduler_step_start_time
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -740,15 +769,46 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
+        
+        print(f"\n[PROFILING] Denoise Loop Summary:")
+        print(f"  - Total UNet time:            {unet_time_total:.2f}s ({unet_time_total/num_inference_steps:.3f}s/step)")
+        print(f"  - Total Guidance time:        {guidance_time_total:.2f}s ({guidance_time_total/num_inference_steps:.3f}s/step)")
+        print(f"  - Total Scheduler Step time:  {scheduler_step_time_total:.2f}s ({scheduler_step_time_total/num_inference_steps:.3f}s/step)")
+        
+        if "profiling_data" in kwargs["cache"]:
+            profiler = kwargs["cache"]["profiling_data"]
+            count = profiler.get("count", 1)
+            total_time = profiler.get('total_block_time', 0.0)
+            if count > 0 and total_time > 0:
+                print("\n--- UNet Block Profiling Summary ---")
+                print(f"Total blocks executed: {count}")
+                print(f"Avg time per block: {total_time / count * 1000:.2f} ms")
+                
+                # Sort items by time contribution
+                sorted_times = sorted(
+                    [(k, v) for k, v in profiler.items() if "time" in k and k != "total_block_time"],
+                    key=lambda item: item[1],
+                    reverse=True
+                )
+
+                for key, value in sorted_times:
+                    print(f"  - Avg {key.replace('_time', ''):<15}: {value / count * 1000:.2f} ms ({(value/total_time)*100:.1f}%)")
+                print("------------------------------------")
 
         if not output_type == "latent":
             # Chunk the VAE decoding process to reduce peak memory
+            torch.cuda.synchronize()
+            vae_decode_start_time = time.time()
+            
             latents = latents / self.vae.config.scaling_factor
             decoded_images = []
             for latent_slice in latents.split(2):
                 decoded_slice = self.vae.decode(latent_slice, return_dict=False, generator=generator)[0]
                 decoded_images.append(decoded_slice)
             image = torch.cat(decoded_images, dim=0)
+            
+            torch.cuda.synchronize()
+            print(f"[PROFILING] VAE Decode for shape {latents.shape} took: {time.time() - vae_decode_start_time:.2f}s")
             
             image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:

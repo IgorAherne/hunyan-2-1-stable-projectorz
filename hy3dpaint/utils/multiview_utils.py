@@ -175,9 +175,18 @@ class multiviewDiffusionNet:
                 self.dino_v2.to("cpu") # Make sure dino remains on CPU
             else:
                 # If not in cache, compute and store them
+                import time
                 dino_device = self.pipeline._execution_device
                 self.dino_v2.to(dino_device)
+                
+                torch.cuda.synchronize()
+                dino_start_time = time.time()
+                
                 dino_hidden_states = self.dino_v2(input_images[0])
+                
+                torch.cuda.synchronize()
+                print(f"[PROFILING] DINO feature extraction took: {time.time() - dino_start_time:.2f}s")
+                
                 self.dino_v2.to("cpu") # Offload DINO back to CPU
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -199,6 +208,10 @@ class multiviewDiffusionNet:
         # Otherwise, fall back to the scheduler-specific dictionary for the main run.
         num_inference_steps = num_inference_steps if num_inference_steps is not None else infer_steps_dict[self.pipeline.scheduler.__class__.__name__]
 
+        import time
+        torch.cuda.synchronize()
+        pipeline_start_time = time.time()
+        
         mvd_image = self.pipeline(
             input_images[0:1],
             num_inference_steps=num_inference_steps,
@@ -207,6 +220,9 @@ class multiviewDiffusionNet:
             guidance_scale=3.0,
             **kwargs,
         ).images
+
+        torch.cuda.synchronize()
+        print(f"[PROFILING] Main diffusion pipeline call took: {time.time() - pipeline_start_time:.2f}s")
 
         if "pbr" in self.mode:
             mvd_image = {"albedo": mvd_image[:num_view], "mr": mvd_image[num_view:]}

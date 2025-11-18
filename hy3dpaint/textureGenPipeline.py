@@ -151,6 +151,7 @@ class Hunyuan3DPaintPipeline:
         else:
             image_prompt = image_path
 
+        time_marker = time.time()
         # Process mesh
         path = os.path.dirname(mesh_path)
         if use_remesh:
@@ -167,6 +168,7 @@ class Hunyuan3DPaintPipeline:
         mesh = trimesh.load(processed_mesh_path)
         mesh = mesh_uv_wrap(mesh)
         self.render.load_mesh(mesh=mesh)
+        print(f"[PROFILING] Mesh Loading & Processing took: {time.time() - time_marker:.2f}s")
 
         ########### View Selection #########
         time_marker = time.time()
@@ -206,7 +208,7 @@ class Hunyuan3DPaintPipeline:
         all_multiviews_pbr = {"albedo": [], "mr": []}
         num_views = len(selected_camera_elevs)
         chunk_size = self.config.view_chunk_size
-        persistent_cache = {} # Create a cache that will persist across chunks
+        persistent_cache = {"profiling_data": {}} # Create a cache that will persist across chunks
 
         # not processing all the views at once
         for i in tqdm(range(0, num_views, chunk_size), desc="Processing views in chunks", position=0, leave=True):

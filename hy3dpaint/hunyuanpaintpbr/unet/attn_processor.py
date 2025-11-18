@@ -483,7 +483,6 @@ class AttnCore:
     This class provides the fundamental attention computation pipeline
     that can be reused across different attention processor implementations.
     """
-
     @staticmethod
     def process_attention_base(
         attn: Attention,
@@ -521,7 +520,7 @@ class AttnCore:
             Tuple containing (attention_output, residual, input_ndim, shape_info,
             batch_size, num_heads, head_dim)
         """
-        # Check global profiler state
+        import time
         profiling = BlockProfiler.enabled
 
         # Prepare hidden states
@@ -561,7 +560,7 @@ class AttnCore:
         # Apply normalization
         query, key = AttnUtils.apply_norms(query, key, getattr(attn, "norm_q", None), getattr(attn, "norm_k", None))
 
-        # Apply RoPE
+        # Apply RoPE if provided
         if apply_rope_fn is not None:
             if profiling:
                 torch.cuda.synchronize()
@@ -574,7 +573,6 @@ class AttnCore:
                 BlockProfiler.data["rope_time"] += (time.time() - rope_start_time)
 
         # Check if FlashAttention can be used
-        # It requires float16/bfloat16 and no attention mask.
         use_flash_attention = (
             not disable_flash_attention
             and FLASH_ATTENTION_AVAILABLE
@@ -588,8 +586,6 @@ class AttnCore:
             BlockProfiler.data["sdpa_time_count"] += 1
 
         if use_flash_attention:
-            # FlashAttention requires the shape (batch_size, seq_len, num_heads, head_dim)
-            # We need to transpose from (batch_size, num_heads, seq_len, head_dim)
             query = query.transpose(1, 2)
             key = key.transpose(1, 2)
             value = value.transpose(1, 2)
@@ -598,10 +594,8 @@ class AttnCore:
                 query, key, value, dropout_p=0.0, causal=False
             )
 
-            # Transpose back to the expected shape (batch_size, num_heads, seq_len, head_dim)
             hidden_states = hidden_states.transpose(1, 2)
         else:
-            # Compute attention
             hidden_states = F.scaled_dot_product_attention(
                 query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
             )
@@ -609,7 +603,7 @@ class AttnCore:
         if profiling:
             torch.cuda.synchronize()
             BlockProfiler.data["sdpa_time"] += (time.time() - sdpa_start_time)
-            
+
         return hidden_states, residual, input_ndim, shape_info, batch_size, attn.heads, head_dim
 
 
@@ -621,9 +615,7 @@ class PoseRoPEAttnProcessor2_0:
     This processor extends standard attention with 3D rotary position embeddings
     to provide spatial awareness for 3D scene understanding tasks.
     """
-
     def __init__(self):
-        """Initialize the RoPE attention processor."""
         AttnUtils.check_pytorch_compatibility()
 
     def __call__(
@@ -707,14 +699,7 @@ class SelfAttnProcessor2_0(BaseAttnProcessor):
     This processor handles multiple PBR material types (e.g., albedo, metallic-roughness)
     with separate attention computation paths for each material type.
     """
-
     def __init__(self, **kwargs):
-        """
-        Initialize self-attention processor with PBR support.
-
-        Args:
-            **kwargs: Arguments passed to BaseAttnProcessor initialization
-        """
         super().__init__(**kwargs)
         self.register_pbr_modules(["qkv", "out", "add_kv"], **kwargs)
 
@@ -763,18 +748,17 @@ class SelfAttnProcessor2_0(BaseAttnProcessor):
                 getattr(target, f"to_v{token_suffix}")(encoder_hidden_states),
             )
 
-        # Core processing using shared logic
         hidden_states, residual, input_ndim, shape_info, batch_size, heads, head_dim = AttnCore.process_attention_base(
             attn, hidden_states, encoder_hidden_states, attention_mask, temb, get_qkv_fn=get_qkv, **kwargs
         )
 
-        # Finalize
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, heads * head_dim)
         hidden_states = hidden_states.to(hidden_states.dtype)
 
         return AttnUtils.finalize_output(
             hidden_states, input_ndim, shape_info, attn, residual, getattr(target, f"to_out{token_suffix}")
         )
+
 
     def __call__(
         self,
@@ -823,20 +807,10 @@ class SelfAttnProcessor2_0(BaseAttnProcessor):
 class RefAttnProcessor2_0(BaseAttnProcessor):
     """
     Reference attention processor with shared value computation across PBR materials.
-
-    This processor computes query and key once, but uses separate value projections
-    for different PBR material types, enabling efficient multi-material processing.
     """
-
     def __init__(self, **kwargs):
-        """
-        Initialize reference attention processor.
-
-        Args:
-            **kwargs: Arguments passed to BaseAttnProcessor initialization
-        """
         super().__init__(**kwargs)
-        self.pbr_settings = self.pbr_setting  # Alias for compatibility
+        self.pbr_settings = self.pbr_setting
         self.register_pbr_modules(["v_only", "out"], **kwargs)
 
     def __call__(
@@ -849,40 +823,20 @@ class RefAttnProcessor2_0(BaseAttnProcessor):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        """
-        Apply reference attention with shared Q/K and separate V projections.
-
-        This method computes query and key tensors once and reuses them across
-        all PBR material types, while using separate value projections for each
-        material type to maintain material-specific information.
-
-        Args:
-            attn: Attention module instance
-            hidden_states: Input hidden states tensor
-            encoder_hidden_states: Optional encoder hidden states for cross-attention
-            attention_mask: Optional attention mask tensor
-            temb: Optional temporal embedding tensor
-            *args: Additional positional arguments
-            **kwargs: Additional keyword arguments
-
-        Returns:
-            Stacked attention output for all PBR material types
-        """
         AttnUtils.handle_deprecation_warning(args, kwargs)
 
         def get_qkv(attn, hidden_states, encoder_hidden_states, **kwargs):
             query = attn.to_q(hidden_states)
             key = attn.to_k(encoder_hidden_states)
 
-            # Concatenate values from all PBR settings
             value_list = [attn.to_v(encoder_hidden_states)]
             for token in ["_" + token for token in self.pbr_settings if token != "albedo"]:
                 value_list.append(getattr(attn.processor, f"to_v{token}")(encoder_hidden_states))
             value = torch.cat(value_list, dim=-1)
 
             return query, key, value
-
         # Core processing
+        # hidden_states output is [Batch, Heads, SeqLen, HeadDim_Total]
         hidden_states, residual, input_ndim, shape_info, batch_size, heads, head_dim = AttnCore.process_attention_base(
             attn,
             hidden_states,
@@ -894,7 +848,6 @@ class RefAttnProcessor2_0(BaseAttnProcessor):
             **kwargs,
         )
 
-        # Split and process each PBR setting output
         hidden_states_list = torch.split(hidden_states, head_dim, dim=-1)
         output_hidden_states_list = []
 

@@ -74,7 +74,7 @@ class multiviewDiffusionNet:
             unet=unet,
             scheduler=scheduler,
             feature_extractor=feature_extractor,
-            use_torch_compile=True, 
+            use_torch_compile=False, # Explicitly disabled 
         )
 
         pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config, timestep_spacing="trailing")
@@ -87,17 +87,23 @@ class multiviewDiffusionNet:
         dual_unet = pipeline.unet.unet_dual
 
         # 1. Enable Gradient Checkpointing for both
+        # Note: For strict inference without backward pass, this might add slight overhead 
+        # but saves significant VRAM for activations. Keep it if VRAM is tight.
         main_unet.enable_gradient_checkpointing()
         if dual_unet is not None:
             dual_unet.enable_gradient_checkpointing()
 
-        # 2. Manually enable Forward Chunking for both
+        # 2. OPTIMIZATION FIX: Disable aggressive Forward Chunking
+        # The original code set this to 1, which caused the FFN to run sequentially 
+        # for every single token, causing massive slowdowns.
+        # Setting to None disables chunking (fastest).
+        # If you OOM, try setting `mod._chunk_size` to 1024 or 2048 instead of 1.
         for unet_model in [main_unet, dual_unet]:
             if unet_model is None:
                 continue
             for mod in unet_model.modules():
                 if isinstance(mod, (BasicTransformerBlock, Basic2p5DTransformerBlock)):
-                    mod._chunk_size = 1
+                    mod._chunk_size = None # FASTEST
                     mod._chunk_dim = 1
 
         # Enable model CPU offloading to save VRAM

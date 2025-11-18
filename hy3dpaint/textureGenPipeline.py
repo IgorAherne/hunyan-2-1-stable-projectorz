@@ -267,13 +267,18 @@ class Hunyuan3DPaintPipeline:
         if "mr" in multiviews_pbr:
             enhance_images["mr"] = copy.deepcopy(multiviews_pbr["mr"])
 
-        # Load super-resolution model sequentially
+        # Load super-resolution model
         self.load_model("super_model")
         time_marker = time.time()
-        for i in range(len(enhance_images["albedo"])):
-            enhance_images["albedo"][i] = self.models["super_model"](enhance_images["albedo"][i])
-            if "mr" in enhance_images:
-                enhance_images["mr"][i] = self.models["super_model"](enhance_images["mr"][i])
+        
+        # OPTIMIZATION: Pass the entire list at once to enable batching
+        print(f"Upscaling {len(enhance_images['albedo'])} albedo maps...")
+        enhance_images["albedo"] = self.models["super_model"](enhance_images["albedo"])
+        
+        if "mr" in enhance_images:
+            print(f"Upscaling {len(enhance_images['mr'])} mr maps...")
+            enhance_images["mr"] = self.models["super_model"](enhance_images["mr"])
+            
         print(f"[PROFILING] Super-Resolution took: {time.time() - time_marker:.2f}s")
         
         # Offload super-resolution model

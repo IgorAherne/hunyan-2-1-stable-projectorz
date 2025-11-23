@@ -330,14 +330,12 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         batch_size = hidden_states.shape[0]
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
 
-        # --- PROFILING ---
         profiling = BlockProfiler.enabled
         if profiling:
             torch.cuda.synchronize()
             block_start_time = time.time()
             # Pass the profiler dict to attention processors via kwargs
             cross_attention_kwargs["profiling_data"] = BlockProfiler.data
-        # -----------------
 
         num_in_batch = cross_attention_kwargs.pop("num_in_batch", 1)
         mode = cross_attention_kwargs.pop("mode", None)

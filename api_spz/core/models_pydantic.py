@@ -22,6 +22,7 @@ class GenerationArgForm(BaseModel):
     num_inference_steps: int = 20
     octree_resolution: int = 256
     num_chunks: int = 80
+    unwrap_uv:bool = True,
     apply_texture: bool = False,
     mesh_simplify: float = 10.0
     texture_size: int = 4096 #final texture size (will upscale up to here). Rendering will still be at 768 etc.

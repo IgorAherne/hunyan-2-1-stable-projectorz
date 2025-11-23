@@ -6,9 +6,12 @@ import traceback
 from typing import Optional, List, Dict
 import asyncio
 import io
+import xatlas
 import base64
 import trimesh
 from trimesh.visual import material
+import numpy as np
+
 from fastapi import APIRouter, File, Response, UploadFile, Form, HTTPException, Depends
 from fastapi.responses import FileResponse
 from PIL import Image
@@ -22,11 +25,12 @@ from api_spz.core.models_pydantic import (
     StatusResponse,
 )
 from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+from hy3dpaint.utils.uvwrap_utils import mesh_uv_wrap
 
 router = APIRouter()
 logger = logging.getLogger("hunyuan3d_api")
 
-# --- State Management in the main process ---
+# State Management in the main process
 generation_lock = asyncio.Lock()
 current_generation = {
     "status": TaskStatus.FAILED, "progress": 0, "message": "",
@@ -89,8 +93,53 @@ def _blocking_full_generation_task(pil_images: List[Image.Image], arg: Generatio
             target_faces = int(len(mesh.faces) * simplify_ratio)
             mesh = state.face_reducer(mesh, max_facenum=target_faces)
         
+        # 3.5 Conditional UV Unwrapping
+        if getattr(arg, 'unwrap_uv', False) and not arg.apply_texture:
+            logger.info("[WORKER] Starting UV Unwrapping (Shape Only)...")
+            update_current_generation(progress=58, message="Unwrapping UVs...")
+            
+            if isinstance(mesh, trimesh.Scene):
+                mesh = mesh.dump(concatenate=True)
+            
+            import numpy as np
+            import xatlas
+            
+            vertices = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
+            faces = np.ascontiguousarray(mesh.faces, dtype=np.uint32)
+
+            # 1. Chart Options: REDUCE CRUMBS
+            chart_options = xatlas.ChartOptions()
+            # maxCost: Higher = allow more stretch (distortion) to keep charts together.
+            # Default is 2.0. Raising to 4.0 or higher reduces cuts.
+            chart_options.maxCost = 8.0  
+            # normalDeviationWeight: Lower = ignore surface bumps/curvature more.
+            # Default is 2.0. Lowering to 0.5 helps wrap around bumpy generated geometry.
+            chart_options.normalDeviationWeight = 0.5 
+
+            # 2. Pack Options: SPEED
+            pack_options = xatlas.PackOptions()
+            pack_options.bruteForce = False
+            pack_options.resolution = 1024
+            # padding: distance between charts. 2 is standard for 1024.
+            pack_options.padding = 2 
+
+            atlas = xatlas.Atlas()
+            atlas.add_mesh(vertices, faces)
+            
+            # Apply both options
+            atlas.generate(chart_options=chart_options, pack_options=pack_options)
+            
+            vmapping, indices, uvs = atlas[0]
+            
+            mesh = trimesh.Trimesh(
+                vertices=mesh.vertices[vmapping],
+                faces=indices,
+                visual=trimesh.visual.TextureVisuals(uv=uvs),
+                process=False 
+            )
+
         # 4. Apply texture if requested. The texture pipeline will perform its own
-        #    internal simplification (Remesher) for UV unwrapping.
+        #    internal UV unwrapping.
         if arg.apply_texture:
             update_current_generation(progress=60, message="Applying texture...")
             temp_obj_path = file_manager.get_temp_path("temp_for_texture.obj")
@@ -148,6 +197,7 @@ def _blocking_full_generation_task(pil_images: List[Image.Image], arg: Generatio
         update_current_generation(status=TaskStatus.FAILED, message=str(e))
         raise
 
+
 # API Endpoints
 @router.get("/ping")
 async def ping():
@@ -200,7 +250,7 @@ async def process_ui_generation_request(data: dict):
         await asyncio.to_thread(_blocking_full_generation_task, pil_images, arg)
         
         # If we get here, the task succeeded.
-        update_current_generation(status=TaskStatus.COMPLETE, progress=100, message="Generation complete")
+        update_current_generation(status=TaskStatus.COMPLETE, progress=100, message="Generation complete\n"+"-"*100)
         file_manager.cleanup_intermediate_files(keep_model=True)
         duration = time.time() - start_time
         logger.info(f"[ENDPOINT /generate] Generation successful in {duration:.2f} seconds.")

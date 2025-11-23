@@ -1,4 +1,4 @@
-A [One-click installer for Windows](https://github.com/IgorAherne/hunyan-2-1-stable-projectorz/releases/tag/latest): (Python 3.11, Cuda 12.8)
+A [One-click installer for Windows](https://github.com/IgorAherne/hunyan-2-1-stable-projectorz/releases/tag/latest): (Python 3.11, Cuda 12.8) optimized for gpus, so it runs efficiently with 8GB instead of 16.
 
 Repository for integration of Tencent Hunyan3D-2.1 with the [StableProjectorz](https://stableprojectorz.com/), a free AI-texturing tool.<br>
 

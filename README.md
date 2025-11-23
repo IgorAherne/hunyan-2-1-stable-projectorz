@@ -1,3 +1,22 @@
+A [One-click installer for Windows](https://github.com/IgorAherne/Hunyuan3D-2-stable-projectorz/releases/tag/latest): (Python 3.11, Cuda 12.8)
+
+Repository for integration of Tencent Hunyan3D-2.1 with the [StableProjectorz](https://stableprojectorz.com/), a free AI-texturing tool.<br>
+
+StableProjectorz .bat files have my additional memory optimizations for texturing. Browser .bat files use the original implementation.<br>
+Our Discord server: [here](https://discord.gg/aWbnX2qan2)
+
+<h2>If you want to install manually:</h2>
+
+1) use python 3.11
+2) follow steps in `code/install.py` around line 189, method `install_dependencies()`
+3) you will need to pip install wheel files, find them in `code/whl` folder.
+4) launch via:
+- for browser `run-browser/run-gradio-med-vram.bat`
+- for StableProjectorz program (with memory optimizations during texturing) via `run-projectorz/run-stableprojectorz-med-vram.bat`
+
+<br>
+<h2>Original Hunyuan3D-2.1 Repo description:</h2>
+
 
 <p align="center">
   <img src="assets/images/teaser.jpg">

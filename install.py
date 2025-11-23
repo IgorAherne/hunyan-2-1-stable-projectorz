@@ -191,10 +191,8 @@ def install_dependencies():
         # Local wheel files (Placeholders)
         # Assuming wheels will be placed in 'code/whl' and compiled for Python 3.11 (cp311)
         wheel_files = {
-            # Replace these placeholders with the actual names of your compiled wheels
             "custom_rasterizer": "whl/custom_rasterizer-0.1-cp311-cp311-win_amd64.whl",
             "differentiable_renderer": "whl/differentiable_renderer_mesh_painter-0.1-cp311-cp311-win_amd64.whl",
-            "flash-attention": "whl/flash_attn-2.8.3+cu128torch2.8.0cxx11abiTRUE-cp311-cp311-win_amd64.whl",
             # Add other wheels as needed
         }
 

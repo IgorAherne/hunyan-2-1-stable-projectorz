@@ -17,12 +17,11 @@
 # Apply torchvision compatibility fix before other imports
 
 import sys
+import os
 sys.path.insert(0, './hy3dshape')
 sys.path.insert(0, './hy3dpaint')
 
-# Set the torch.compile cache directory *before* importing torch, 
-# using the modern Inductor environment variables.
-import os
+os.environ['HY3DGEN_DEBUG'] = '1' 
 
 try:
     from torchvision_fix import apply_fix
@@ -58,7 +57,7 @@ from hy3dpaint.convert_utils import create_glb_with_pbr_materials
 
 # Set to True to skip shape generation and use a placeholder mesh for testing texturing.
 # You must provide a mesh at `assets/debug_mesh.obj` for this to work.
-DEBUG_SKIP_SHAPE_GENERATION = True #MODIF
+DEBUG_SKIP_SHAPE_GENERATION = False #MODIF
 
 MAX_SEED = 1e7
 ENV = "Local" # "Huggingface"
@@ -236,6 +235,10 @@ def run_shape_generation_in_process(queue, args_dict):
     This function runs in a separate process to ensure all memory (RAM and VRAM)
     is released upon completion.
     """
+    import time
+    process_start_time = time.time()
+    print(f"[PROFILE] Worker Process Started")
+
     try:
         # Re-import and initialize everything within the new process
         import torch
@@ -248,9 +251,12 @@ def run_shape_generation_in_process(queue, args_dict):
             args_dict['model_path'], subfolder=args_dict['subfolder'], use_safetensors=False, 
             device=args_dict['device'], dtype=torch.float16
         )
+        
+        print(f"[PROFILE] Enable FlashVDM: {args_dict.get('enable_flashvdm', False)}")
+        
         if args_dict['enable_flashvdm']:
             shape_pipeline.enable_flashvdm(mc_algo='mc' if args_dict['device'] in ['cpu', 'mps'] else args_dict['mc_algo'])
-        
+
         generator = torch.Generator()
         generator = generator.manual_seed(int(args_dict['seed']))
         
@@ -266,6 +272,9 @@ def run_shape_generation_in_process(queue, args_dict):
         )
         # Convert to trimesh inside the worker
         mesh = export_to_trimesh(outputs)[0]
+
+        torch.cuda.synchronize()
+        print(f"[PROFILE] Worker Process Total Time: {time.time() - process_start_time:.4f}s")
         
         stats = { 'number_of_faces': mesh.faces.shape[0], 'number_of_vertices': mesh.vertices.shape[0] }
 
@@ -302,7 +311,7 @@ def generation_all(
     seed=1234,
     octree_resolution=256,
     check_box_rembg=False,
-    num_chunks=200000,
+    num_chunks=100000,
     randomize_seed: bool = False,
 ):
     start_time_0 = time.time()
@@ -458,7 +467,7 @@ def shape_generation(
     seed=1234,
     octree_resolution=256,
     check_box_rembg=False,
-    num_chunks=200000,
+    num_chunks=100000,
     randomize_seed: bool = False,
 ):
     start_time_0 = time.time()
@@ -657,7 +666,7 @@ Fast for very complex cases, Standard seldom use.',
                                                           label='Octree Resolution')
                         with gr.Row():
                             cfg_scale = gr.Number(value=5.0, label='Guidance Scale', min_width=100)
-                            num_chunks = gr.Slider(maximum=5000000, minimum=1000, value=8000,
+                            num_chunks = gr.Slider(maximum=5000000, minimum=1000, value=100000,
                                                    label='Number of Chunks', min_width=100)
                     with gr.Tab("Export", id='tab_export'):
                         with gr.Row():
@@ -668,7 +677,7 @@ Fast for very complex cases, Standard seldom use.',
                                                       value=False, min_width=100)
                             export_texture = gr.Checkbox(label='Include Texture', value=False,
                                                          visible=False, min_width=100)
-                        target_face_num = gr.Slider(maximum=1000000, minimum=100, value=8000,
+                        target_face_num = gr.Slider(maximum=1000000, minimum=100, value=30000,
                                                     label='Target Face Number')
                         with gr.Row():
                             confirm_export = gr.Button(value="Transform", min_width=100)

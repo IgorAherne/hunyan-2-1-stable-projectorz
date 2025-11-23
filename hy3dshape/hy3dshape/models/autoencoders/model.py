@@ -211,10 +211,16 @@ class VectsetVAE(nn.Module):
         self.surface_extractor = surface_extractor
 
     def latents2mesh(self, latents: torch.FloatTensor, **kwargs):
+        import time
+        t0 = time.time()
         with synchronize_timer('Volume decoding'):
             grid_logits = self.volume_decoder(latents, self.geo_decoder, **kwargs)
+        torch.cuda.synchronize()
+        print(f"[PROFILE] Total Volume Decoding: {time.time() - t0:.4f}s")
+        t0 = time.time()
         with synchronize_timer('Surface extraction'):
             outputs = self.surface_extractor(grid_logits, **kwargs)
+        print(f"[PROFILE] Total Surface Extraction: {time.time() - t0:.4f}s")
         return outputs
 
     def enable_flashvdm_decoder(

@@ -394,12 +394,22 @@ class Hunyuan3DDiT(nn.Module):
         cond = self.cond_in(cond)
         pe = None
 
+        import time
+        t_start = time.time()
+
         for block in self.double_blocks:
             latent, cond = block(img=latent, txt=cond, vec=vec, pe=pe)
+
+        torch.cuda.synchronize()
+        print(f"[PROFILE] DiT Double Blocks ({len(self.double_blocks)}): {time.time() - t_start:.4f}s", flush=True)
+        t_start = time.time()
 
         latent = torch.cat((cond, latent), 1)
         for block in self.single_blocks:
             latent = block(latent, vec=vec, pe=pe)
+
+        torch.cuda.synchronize()
+        print(f"[PROFILE] DiT Single Blocks ({len(self.single_blocks)}): {time.time() - t_start:.4f}s", flush=True)
 
         latent = latent[:, cond.shape[1]:, ...]
         latent = self.final_layer(latent, vec)

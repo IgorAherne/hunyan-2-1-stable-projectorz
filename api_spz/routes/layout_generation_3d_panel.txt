@@ -21,7 +21,7 @@ vgroup padl=4 padr=4 spacing=8 flexibleWidth=1
                 space  minWidth=20  flexibleHeight=1  flexibleWidth=1
                 slider  code_name=(octree_resolution)  visible_name=(octree\nresolution)  min=128  max=512  default=256  show_n_decimals=0  flexibleHeight=1
                 space  minWidth=20  preferredWidth=30  flexibleHeight=1
-                slider  code_name=(num_chunks)  visible_name=(speed\nchunks)  min=1  max=200  default=6  show_n_decimals=0  flexibleHeight=1
+                slider  code_name=(num_chunks)  visible_name=(speed\nchunks)  min=1  max=512  default=200  show_n_decimals=0  flexibleHeight=1
                 space  minWidth=20  flexibleHeight=1  flexibleWidth=1       
     
     go minHeight=140 preferredHeight=140 flexibleWidth=1

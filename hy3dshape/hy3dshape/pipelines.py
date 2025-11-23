@@ -606,6 +606,7 @@ class Hunyuan3DDiTPipeline:
             raise ValueError(f"Unknown mc_algo {mc_algo}")
         self.vae.surface_extractor = SurfaceExtractors[mc_algo]()
 
+
     @torch.no_grad()
     def __call__(
         self,
@@ -683,8 +684,11 @@ class Hunyuan3DDiTPipeline:
                 guidance_scale_tensor, embedding_dim=self.model.guidance_cond_proj_dim
             ).to(device=device, dtype=latents.dtype)
         
+        import time 
+
         with synchronize_timer('Diffusion Sampling'):
             # Micro-Optimization: Move cond back to GPU right before use
+            t0 = time.time()
             if isinstance(cond, dict):
                 for k in cond:
                     if isinstance(cond[k], torch.Tensor):
@@ -694,8 +698,13 @@ class Hunyuan3DDiTPipeline:
 
             # Optimization: Move the main model to the GPU for the loop
             self.model.to(device)
+            torch.cuda.synchronize()
+            print(f"[PROFILE] Moving Cond + Model to GPU: {time.time() - t0:.4f}s")
+            
+            step_times = []
 
             for i, t in enumerate(tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:", leave=False)):
+                t_step_start = time.time()
                 # expand the latents if we are doing classifier free guidance
                 if do_classifier_free_guidance:
                     latent_model_input = torch.cat([latents] * (3 if dual_guidance else 2))
@@ -710,7 +719,10 @@ class Hunyuan3DDiTPipeline:
                 # Ensure input to model is in the correct dtype
                 latent_model_input = latent_model_input.to(self.dtype)
 
+                t_model_start = time.time()
                 noise_pred = self.model(latent_model_input, timestep_tensor, cond, guidance_cond=guidance_cond)
+                torch.cuda.synchronize()
+                model_time = time.time() - t_model_start
 
                 # no drop, drop clip, all drop
                 if do_classifier_free_guidance:
@@ -733,21 +745,39 @@ class Hunyuan3DDiTPipeline:
                     step_idx = i // getattr(self.scheduler, "order", 1)
                     callback(step_idx, t, outputs)
 
-            # Optimization: Offload the main model after the loop
-            self.model.to('cpu')
+            if step_times:
+                print(f"[PROFILE] Avg Step Time: {sum(step_times)/len(step_times):.4f}s")
+            
+            # OPTIMIZATION: Aggressive cleanup to kill VRAM hump before VAE loads
+            t0 = time.time()
+            self.model = None
+            self.conditioner = None
+            cond = None
+            guidance = None
+            guidance_cond = None
+            
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            torch.cuda.synchronize()
+            print(f"[PROFILE] Deleting Diffusion Model & Cleanup: {time.time() - t0:.4f}s")
 
         # Ensure model hooks are freed if CPU offloading is used
         self.maybe_free_model_hooks()
 
         # Optimization: Bring VAE back to GPU only when needed for export.
+        t0 = time.time()
         self.vae.to(device)
+        torch.cuda.synchronize()
+        print(f"[PROFILE] Moving VAE to GPU: {time.time() - t0:.4f}s")
         outputs = self._export(
             latents,
             output_type,
             box_v, mc_level, num_chunks, octree_resolution, mc_algo,
         )
         # Optimization: Offload VAE again after use before returning.
-        self.vae.to('cpu')
+        # self.vae.to('cpu')
         
         return outputs
 
@@ -862,9 +892,12 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
             self.model.guidance_embed is True:
             guidance = torch.tensor([guidance_scale] * batch_size, device=device, dtype=dtype)
             # logger.info(f'Using guidance embed with scale {guidance_scale}')
+        
+        import time
 
         with synchronize_timer('Diffusion Sampling'):
             # Micro-Optimization: Move cond back to GPU right before use
+            t0 = time.time()
             if isinstance(cond, dict):
                 for k in cond:
                     if isinstance(cond[k], torch.Tensor):
@@ -874,8 +907,13 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
 
             # Optimization: Move the main model to the GPU for the loop
             self.model.to(device)
+            torch.cuda.synchronize()
+            print(f"[PROFILE] Moving Cond + Model to GPU: {time.time() - t0:.4f}s")
+            
+            step_times = []
                 
             for i, t in enumerate(tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:")):
+                t_step_start = time.time()
                 # expand the latents if we are doing classifier free guidance
                 if do_classifier_free_guidance:
                     latent_model_input = torch.cat([latents] * 2)
@@ -889,7 +927,10 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
                 # Ensure input to model is in the correct dtype
                 latent_model_input = latent_model_input.to(self.dtype)
 
+                t_model_start = time.time()
                 noise_pred = self.model(latent_model_input, timestep, cond, guidance=guidance)
+                torch.cuda.synchronize()
+                model_time = time.time() - t_model_start
 
                 if do_classifier_free_guidance:
                     noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
@@ -902,15 +943,35 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
                 if callback is not None and i % callback_steps == 0:
                     step_idx = i // getattr(self.scheduler, "order", 1)
                     callback(step_idx, t, outputs)
+                
+                torch.cuda.synchronize()
+                step_total = time.time() - t_step_start
+                step_times.append(step_total)
+                if i % 10 == 0:
+                    print(f"[PROFILE] Step {i}: Total={step_total:.4f}s | ModelOnly={model_time:.4f}s")
 
             # Optimization: Offload the main model after the loop
-            self.model.to('cpu')
+            if step_times:
+                print(f"[PROFILE] Avg Step Time: {sum(step_times)/len(step_times):.4f}s")
+            t0 = time.time()
+
+            # OPTIMIZATION: Delete model instead of offload to clear VRAM hump
+            self.model = None
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            torch.cuda.synchronize()
+            print(f"[PROFILE] Deleting Model from VRAM: {time.time() - t0:.4f}s")
 
         # Ensure model hooks are freed if CPU offloading is used
         self.maybe_free_model_hooks()
 
         # Optimization: Bring VAE back to GPU only when needed for export.
+        t0 = time.time()
         self.vae.to(device)
+        torch.cuda.synchronize()
+        print(f"[PROFILE] Moving VAE to GPU: {time.time() - t0:.4f}s")
         outputs = self._export(
             latents,
             output_type,
@@ -918,6 +979,6 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
             enable_pbar=enable_pbar,
         )
         # Optimization: Offload VAE again after use before returning.
-        self.vae.to('cpu')
+        # self.vae.to('cpu')
 
         return outputs

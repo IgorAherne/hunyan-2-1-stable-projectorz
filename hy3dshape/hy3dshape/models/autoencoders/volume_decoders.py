@@ -186,12 +186,30 @@ class VanillaVolumeDecoder:
 
         # 2. latents to 3d volume
         batch_logits = []
+        
+        import time
+        t_loop = time.time()
+        t_gpu_calc = 0
+        chunks_count = 0
+        
+        print(f"[PROFILE] Vanilla Decoder Start. Total Points: {xyz_samples.shape[0]}, Chunk Size: {num_chunks}", flush=True)
+
         for start in tqdm(range(0, xyz_samples.shape[0], num_chunks), desc=f"Volume Decoding",
                           disable=not enable_pbar):
             chunk_queries = xyz_samples[start: start + num_chunks, :]
             chunk_queries = repeat(chunk_queries, "p c -> b p c", b=batch_size)
+            
+            t_calc = time.time()
             logits = geo_decoder(queries=chunk_queries, latents=latents)
+            torch.cuda.synchronize()
+            t_gpu_calc += (time.time() - t_calc)
+            
             batch_logits.append(logits)
+            chunks_count += 1
+
+        total_time = time.time() - t_loop
+        print(f"[PROFILE] Vanilla Loop: {total_time:.4f}s | GPU Calc: {t_gpu_calc:.4f}s | Overhead: {total_time - t_gpu_calc:.4f}s", flush=True)
+        print(f"[PROFILE] Avg Time per Chunk: {total_time/chunks_count*1000:.2f}ms", flush=True)
 
         grid_logits = torch.cat(batch_logits, dim=1)
         grid_logits = grid_logits.view((batch_size, *grid_size)).float()
@@ -206,7 +224,7 @@ class HierarchicalVolumeDecoding:
         latents: torch.FloatTensor,
         geo_decoder: Callable,
         bounds: Union[Tuple[float], List[float], float] = 1.01,
-        num_chunks: int = 20000, # Increased from 10000 to 20000
+        num_chunks: int = 100000,
         mc_level: float = 0.0,
         octree_resolution: int = None,
         min_resolution: int = 63,
@@ -334,7 +352,7 @@ class FlashVDMVolumeDecoding:
         latents: torch.FloatTensor,
         geo_decoder: CrossAttentionDecoder,
         bounds: Union[Tuple[float], List[float], float] = 1.01,
-        num_chunks: int = 20000, # Increased from 10000 to 20000
+        num_chunks: int = 20000,
         mc_level: float = 0.0,
         octree_resolution: int = None,
         min_resolution: int = 63,
@@ -375,19 +393,14 @@ class FlashVDMVolumeDecoding:
             indexing="ij"
         )
 
-        # Use max_pool3d for dilation instead of Conv3d
         def dilate_fn(x):
-             # Use float32 for max_pool3d if input is bfloat16/float16
             input_dtype = x.dtype
             if input_dtype in [torch.bfloat16, torch.float16]:
                 x = x.to(torch.float32)
-            
-            # Ensure 5D input for max_pool3d
             if x.dim() == 3:
                 x = x.unsqueeze(0).unsqueeze(0)
             elif x.dim() == 4:
                  x = x.unsqueeze(0)
-
             dilated = F.max_pool3d(x, kernel_size=3, stride=1, padding=1)
             return (dilated > 0).to(dtype)
 
@@ -396,6 +409,8 @@ class FlashVDMVolumeDecoding:
         # 2. latents to 3d volume
         xyz_samples = torch.from_numpy(xyz_samples).to(device, dtype=dtype)
         batch_size = latents.shape[0]
+        
+        # Reshape samples to match mini-grid structure
         mini_grid_size = xyz_samples.shape[0] // mini_grid_num
         xyz_samples = xyz_samples.view(
             mini_grid_num, mini_grid_size,
@@ -406,16 +421,37 @@ class FlashVDMVolumeDecoding:
         ).reshape(
             -1, mini_grid_size * mini_grid_size * mini_grid_size, 3
         )
+        
         batch_logits = []
-        num_batchs = max(num_chunks // xyz_samples.shape[1], 1)
-        for start in tqdm(range(0, xyz_samples.shape[0], num_batchs),
-                          desc=f"FlashVDM Volume Decoding", disable=not enable_pbar):
-            queries = xyz_samples[start: start + num_batchs, :]
-            batch = queries.shape[0]
-            batch_latents = repeat(latents.squeeze(0), "p c -> b p c", b=batch)
+        
+        # OPTIMIZATION: Use simple batching (1, N, 3) instead of exploding batch dimension
+        # Flatten xyz_samples to (Total_Chunks, Points_Per_Chunk, 3) -> Reshape to (1, Total_Points, 3) for processing
+        
+        # Actually, xyz_samples shape is (Num_Mini_Grids, Points_Per_Mini_Grid, 3)
+        # We will iterate over Mini Grids, but treat each Mini Grid as a sequence of points, not a batch element.
+        
+        import time
+        t_start = time.time()
+        print(f"[PROFILE] VDM Initial Loop. Samples: {xyz_samples.shape}", flush=True)
+
+        # Processing strategy: 
+        # Iterate over the first dimension (Num_Mini_Grids). 
+        # For each mini-grid, pass it as (1, Points, 3).
+        
+        for i in tqdm(range(xyz_samples.shape[0]), desc="FlashVDM Volume Decoding", disable=not enable_pbar):
+            # queries: (Points_Per_Mini_Grid, 3)
+            queries = xyz_samples[i]
+            # Add Batch dim -> (1, Points, 3)
+            queries = queries.unsqueeze(0)
+            
             processor.topk = True
-            logits = geo_decoder(queries=queries, latents=batch_latents)
+            
+            # latents is already (1, 1024, 1024). No repeat needed.
+            logits = geo_decoder(queries=queries, latents=latents)
             batch_logits.append(logits)
+            
+        print(f"[PROFILE] VDM Initial Loop Done: {time.time() - t_start:.4f}s", flush=True)
+
         grid_logits = torch.cat(batch_logits, dim=0).reshape(
             mini_grid_num, mini_grid_num, mini_grid_num,
             mini_grid_size, mini_grid_size,
@@ -429,9 +465,14 @@ class FlashVDMVolumeDecoding:
             resolution = bbox_size / octree_depth_now
             next_index = torch.zeros(tuple(grid_size), dtype=dtype, device=device)
             next_logits = torch.full(next_index.shape, -10000., dtype=dtype, device=device)
+            
+            # Profiling block
+            # t_surf = time.time()
             curr_points = extract_near_surface_volume_fn(grid_logits.squeeze(0), mc_level)
             curr_points = (curr_points > 0).to(dtype)
             curr_points += grid_logits.squeeze(0).abs() < 0.95
+            # torch.cuda.synchronize()
+            # t_surf_end = time.time() - t_surf
 
             if octree_depth_now == resolutions[-1]:
                 expand_num = 0
@@ -439,14 +480,12 @@ class FlashVDMVolumeDecoding:
                 expand_num = 1
 
             for i in range(expand_num):
-                # Use optimized dilation
                 curr_points = dilate_fn(curr_points).squeeze()
 
             (cidx_x, cidx_y, cidx_z) = torch.where(curr_points > 0)
 
             next_index[cidx_x * 2, cidx_y * 2, cidx_z * 2] = 1
             for i in range(2 - expand_num):
-                # Use optimized dilation
                 next_index = dilate_fn(next_index).squeeze()
             
             nidx = torch.where(next_index > 0)
@@ -469,6 +508,8 @@ class FlashVDMVolumeDecoding:
             logits_grid_list = []
             start_num = 0
             sum_num = 0
+            
+            # t_infer = time.time()
             for grid_index, count in zip(unique_values[0].cpu().tolist(), unique_values[1].cpu().tolist()):
                 if sum_num + count < num_chunks or sum_num == 0:
                     sum_num += count
@@ -476,6 +517,8 @@ class FlashVDMVolumeDecoding:
                     input_grid[1].append(count)
                 else:
                     processor.topk = input_grid
+                    # Ensure next_points slice has batch dim -> (1, Count, 3)
+                    # next_points is already (1, Total, 3), slicing preserves batch dim
                     logits_grid = geo_decoder(queries=next_points[:, start_num:start_num + sum_num], latents=latents)
                     start_num = start_num + sum_num
                     logits_grid_list.append(logits_grid)
@@ -486,6 +529,10 @@ class FlashVDMVolumeDecoding:
                 logits_grid = geo_decoder(queries=next_points[:, start_num:start_num + sum_num], latents=latents)
                 logits_grid_list.append(logits_grid)
             logits_grid = torch.cat(logits_grid_list, dim=1)
+            # torch.cuda.synchronize()
+            # t_infer_end = time.time() - t_infer
+            # print(f"[PROFILE] Res {octree_depth_now}: Surf={t_surf_end:.3f}s | Infer={t_infer_end:.3f}s", flush=True)
+
             grid_logits[index.indices] = logits_grid.squeeze(0).squeeze(-1)
             next_logits[nidx] = grid_logits
             grid_logits = next_logits.unsqueeze(0)

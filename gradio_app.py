@@ -21,7 +21,7 @@ import os
 sys.path.insert(0, './hy3dshape')
 sys.path.insert(0, './hy3dpaint')
 
-os.environ['HY3DGEN_DEBUG'] = '1' 
+os.environ['HY3DGEN_DEBUG'] = '0' 
 
 try:
     from torchvision_fix import apply_fix
